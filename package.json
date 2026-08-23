@@ -1,6 +1,6 @@
 {
   "name": "@mstone6969/vault",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "A write-only credential vault: envelope encryption, key rotation, expiry, history and an encrypted single-file store.",
   "type": "module",
   "license": "MIT",

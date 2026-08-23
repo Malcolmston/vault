@@ -297,6 +297,10 @@ reference cannot fall behind the code the way a table in this file can.
 
 ## Versions
 
+**0.5.4** — repository, homepage and issues metadata, so the README's links to
+the reference resolve on npmjs.com and the package points back at its source.
+The licence file ships too. No code changes.
+
 **0.5.3** — the README points at the generated reference rather than repeating
 it in a table that had already drifted (it still described `put`'s fourth
 argument as bare metadata, which 0.5.0 changed to an options object). No code
