@@ -1,0 +1,3 @@
+[test]
+# Test files should not count towards their own coverage.
+coverageSkipTestFiles = true

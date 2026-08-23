@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+
+      - name: Types
+        run: bun run typecheck
+
+      # Fails if any exported member is missing TSDoc.
+      - name: Documentation
+        run: bun run docs:check
+
+      # Fails if any line or function in src is untested.
+      - name: Tests and coverage
+        run: bun run test:coverage
+
+      - name: Build
+        run: bun run build
+
+      # The package is published for Node as well as Bun, so prove the built
+      # entry point actually imports there.
+      - name: Import from Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node -e "import('./dist/index.js').then(m => { if (!m.Vault) throw new Error('no Vault export') })"
