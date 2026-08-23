@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Run the whole thing without publishing, to prove the pipeline works.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack and check, but do not publish"
+        type: boolean
+        default: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+
+      # A tag that disagrees with package.json means someone tagged the wrong
+      # commit; publishing it would put the wrong version on npm for good.
+      - name: Tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          declared="$(bun --print "require('./package.json').version")"
+          echo "tag $tagged, package.json $declared"
+          [ "$tagged" = "$declared" ] || {
+            echo "::error::tag v$tagged does not match package.json $declared"
+            exit 1
+          }
+
+      # The same gate prepublishOnly runs, spelled out so a failure names the
+      # step that failed rather than one long script.
+      - name: Types
+        run: bun run typecheck
+      - name: Documentation
+        run: bun run docs:check
+      - name: Tests and coverage
+        run: bun run test:coverage
+      - name: Build
+        run: bun run build
+      - name: Reference
+        run: bun run docs
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Import from Node
+        run: node -e "import('./dist/index.js').then(m => { if (!m.Vault) throw new Error('no Vault export') })"
+
+      - name: Pack
+        run: npm pack --dry-run
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          # prepublishOnly already ran above, step by step.
+          npm publish --access public --ignore-scripts

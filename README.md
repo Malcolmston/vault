@@ -328,6 +328,24 @@ carries it. Existing calls keep working: metadata defaults to `{}`. A
 
 **0.1.0** — first release.
 
+## Releasing
+
+Releases are cut by CI, not from a laptop. Bump the version, commit, and push a
+matching tag:
+
+```bash
+npm version patch      # or minor
+git push --follow-tags
+```
+
+The tag triggers the release workflow, which refuses a tag that disagrees with
+`package.json`, runs the same gate as `prepublishOnly` — types, documentation,
+tests at 100%, build, reference, and an import under Node — and only then
+publishes with the `NPM_TOKEN` repository secret.
+
+`workflow_dispatch` runs everything except the publish, for checking the
+pipeline without spending a version number.
+
 ## Development
 
 ```bash
