@@ -314,6 +314,39 @@ export class SqliteStore implements VaultStore {
     }
 
     /**
+     * One page of records, ordered by owner then name.
+     *
+     * @remarks
+     * Keyset paging: `WHERE (owner, name) > (…)` rather than an offset, so a
+     * write during a walk cannot make a page skip or repeat a record.
+     *
+     * @param after The last key of the previous page as owner and name joined
+     *   by a NUL, or null to start.
+     * @param limit At most this many.
+     * @returns Up to `limit` records, in order.
+     */
+    async page(after: string | null, limit: number): Promise<SecretRecord[]> {
+        if (after === null) {
+            return this.db
+                .query<Row, [number]>(
+                    `SELECT * FROM ${this.table} ORDER BY owner, name LIMIT ?`
+                )
+                .all(limit)
+                .map(SqliteStore.toRecord)
+        }
+
+        const [owner = "", name = ""] = after.split("\u0000")
+        return this.db
+            .query<Row, [string, string, string, number]>(
+                `SELECT * FROM ${this.table}
+                 WHERE owner > ? OR (owner = ? AND name > ?)
+                 ORDER BY owner, name LIMIT ?`
+            )
+            .all(owner, owner, name, limit)
+            .map(SqliteStore.toRecord)
+    }
+
+    /**
      * Writes a record only if the stored one is still at `expectedRevision`.
      *
      * @remarks

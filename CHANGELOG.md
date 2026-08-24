@@ -8,6 +8,35 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 1.6.0 — 2026-08-24
+
+Additive. Scale: nothing here needs the whole vault in memory any more.
+
+### Added
+
+- **`VaultStore.page`**, optional, and every shipped store implements it.
+  Keyset paging on `(owner, name)` rather than an offset, so a write during a
+  walk cannot make a page skip or repeat a record.
+- The vault's own whole-store walks — `rekey`, `reseal`, `purgeExpired`,
+  `rotationDue`, `sharedWith`, `exportAll` — go through pages where the store
+  offers them. Six operations that each loaded the entire store into memory now
+  hold one page. A store without `page` falls back to `all()`, exactly as
+  before; nothing breaks.
+- **`Vault.page(owner, { after, limit, where })`** for listing an owner's
+  entries a page at a time, returning the cursor to continue from. `list` is
+  unchanged.
+- **`exportStream` and `importStream`**: an export as one sealed line per
+  entry, so neither end holds the vault. `importAll` reads both this and the
+  original single-blob format, so the choice only has to be made on the way
+  out.
+
+  The trade is worth stating plainly rather than burying: one sealed blob hides
+  how many entries there are and how big each is. A line-per-entry document
+  does not. Use `exportAll` for a vault that fits, `exportStream` for one that
+  does not.
+
+- `pageSize` on `VaultOptions`, and `DEFAULT_PAGE_SIZE`.
+
 ## 1.5.0 — 2026-08-24
 
 Additive. The master key no longer has to exist in the process.

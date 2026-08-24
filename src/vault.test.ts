@@ -2400,3 +2400,230 @@ test("isKeyWrapper tells a wrapper from a key or a provider", () => {
     expect(isKeyWrapper("base64-key")).toBe(false)
     expect(isKeyWrapper(null)).toBe(false)
 })
+
+
+// --- paging and streaming -------------------------------------------------
+
+test("a walk of the whole store reads it a page at a time", async () => {
+    const pages: (string | null)[] = []
+    const paged: VaultStore = {
+        get: (owner, name) => store.get(owner, name),
+        list: (owner) => store.list(owner),
+        all: () => {
+            throw new Error("all() should not be reached when page() exists")
+        },
+        put: (record) => store.put(record),
+        remove: (owner, name) => store.remove(owner, name),
+        page: (after, limit) => {
+            pages.push(after)
+            return store.page(after, limit)
+        },
+    }
+
+    const walking = new Vault({ key: KEY, store: paged, pageSize: 2 })
+    for (const name of ["a", "b", "c", "d", "e"]) {
+        await walking.put("alice", name, "x")
+    }
+
+    expect(await walking.purgeExpired()).toBe(0)
+    // Five records at two per page: three pages, then a short one ends it.
+    expect(pages).toEqual([null, "alice\u0000b", "alice\u0000d"])
+})
+
+test("a store with no page() is still walked, just all at once", async () => {
+    const plain: VaultStore = {
+        get: (owner, name) => store.get(owner, name),
+        list: (owner) => store.list(owner),
+        all: () => store.all(),
+        put: (record) => store.put(record),
+        remove: (owner, name) => store.remove(owner, name),
+    }
+    const walking = new Vault({ key: KEY, store: plain })
+
+    await walking.put("alice", "gone", "x", { expiresAt: new Date(Date.now() - 1) })
+    expect(await walking.purgeExpired()).toBe(1)
+})
+
+test("a page walk of one owner does not need the whole store", async () => {
+    const walking = new Vault({ key: KEY, store, pageSize: 2 })
+    await walking.put("alice", "a", "x")
+    await walking.put("bob", "b", "y")
+
+    expect((await walking.reseal("alice")).rekeyed).toBe(1)
+})
+
+test("paging through a listing gives every entry once, in order", async () => {
+    const names = ["a", "b", "c", "d", "e", "f", "g"]
+    for (const name of names) await vault.put("alice", name, "x")
+
+    const seen: string[] = []
+    let after: string | null = null
+    let rounds = 0
+    do {
+        const page = await vault.page("alice", { after, limit: 3 })
+        seen.push(...page.entries.map((entry) => entry.name))
+        after = page.cursor
+        rounds += 1
+    } while (after !== null && rounds < 10)
+
+    expect(seen).toEqual(names)
+})
+
+test("a paged listing can be narrowed by metadata too", async () => {
+    await vault.put("alice", "one", "x", { metadata: { kind: "api" } })
+    await vault.put("alice", "two", "y", { metadata: { kind: "login" } })
+    await vault.put("alice", "three", "z", { metadata: { kind: "api" } })
+
+    const page = await vault.page("alice", { where: { kind: "api" } })
+    expect(page.entries.map((entry) => entry.name)).toEqual(["one", "three"])
+    expect(page.cursor).toBeNull()
+})
+
+test("an empty page ends the walk", async () => {
+    await vault.put("alice", "only", "x")
+    const first = await vault.page("alice", { limit: 1 })
+    expect(first.cursor).toBe("only")
+
+    const second = await vault.page("alice", { after: first.cursor, limit: 1 })
+    expect(second.entries).toEqual([])
+    expect(second.cursor).toBeNull()
+})
+
+test("a streamed export goes out a line at a time and comes back whole", async () => {
+    await vault.put("alice", "db", "first", { metadata: { kind: "pg" } })
+    await vault.rotate("alice", "db", "second")
+    await vault.put("alice", "open-one", "in the clear", { sealed: false })
+    await vault.put("bob", "his", "own")
+
+    const carried = generateKey()
+    const lines: string[] = []
+    for await (const line of vault.exportStream(carried)) lines.push(line)
+
+    expect(lines[0]).toBe("VAULTEXPORT2")
+    // One line per entry, and none of them legible.
+    expect(lines).toHaveLength(4)
+    expect(lines.join("\n")).not.toContain("second")
+
+    const elsewhere = new Vault({ key: generateKey(), store: new MemoryStore() })
+    expect(await elsewhere.importStream(lines, carried)).toEqual({
+        imported: 3,
+        skipped: [],
+    })
+
+    expect(await elsewhere.open("alice", "db")).toBe("second")
+    expect(await elsewhere.versions("alice", "db")).toEqual(["first"])
+    expect(await elsewhere.read("alice", "open-one")).toBe("in the clear")
+    expect((await elsewhere.list("alice"))[0]?.metadata).toEqual({ kind: "pg" })
+})
+
+test("importAll reads a streamed document as well as a packed one", async () => {
+    await vault.put("alice", "db", "hunter2")
+
+    const carried = generateKey()
+    const lines: string[] = []
+    for await (const line of vault.exportStream(carried)) lines.push(line)
+
+    const elsewhere = new Vault({ key: generateKey(), store: new MemoryStore() })
+    expect(await elsewhere.importAll(lines.join("\n"), carried)).toEqual({
+        imported: 1,
+        skipped: [],
+    })
+    expect(await elsewhere.open("alice", "db")).toBe("hunter2")
+})
+
+test("a streamed export can be limited to one owner", async () => {
+    await vault.put("alice", "hers", "a")
+    await vault.put("bob", "his", "b")
+
+    const carried = generateKey()
+    const lines: string[] = []
+    for await (const line of vault.exportStream(carried, "alice")) lines.push(line)
+
+    const elsewhere = new Vault({ key: generateKey(), store: new MemoryStore() })
+    await elsewhere.importStream(lines, carried)
+    expect(await elsewhere.open("alice", "hers")).toBe("a")
+    expect(await elsewhere.has("bob", "his")).toBe(false)
+})
+
+test("a streamed import leaves what is there alone unless told otherwise", async () => {
+    await vault.put("alice", "db", "theirs")
+    const carried = generateKey()
+    const lines: string[] = []
+    for await (const line of vault.exportStream(carried)) lines.push(line)
+
+    const destination = new Vault({ key: KEY, store: new MemoryStore() })
+    await destination.put("alice", "db", "mine")
+
+    expect(await destination.importStream(lines, carried)).toEqual({
+        imported: 0,
+        skipped: ["alice/db"],
+    })
+    expect(await destination.open("alice", "db")).toBe("mine")
+
+    await destination.importStream(lines, carried, { overwrite: true })
+    expect(await destination.open("alice", "db")).toBe("theirs")
+})
+
+test("a document that is not a streamed export is refused", async () => {
+    const carried = generateKey()
+    await expect(vault.importStream(["NOTAVAULT", "x"], carried)).rejects.toThrow(
+        /not a streamed vault export/
+    )
+    await expect(vault.importStream([], carried)).rejects.toThrow(
+        /not a streamed vault export/
+    )
+    await expect(vault.importAll("NOTAVAULT\nx", carried)).rejects.toThrow(
+        /not a vault export/
+    )
+})
+
+test("a streamed import accepts lines as they arrive", async () => {
+    await vault.put("alice", "db", "hunter2")
+    const carried = generateKey()
+
+    async function* trickle(): AsyncGenerator<string> {
+        for await (const line of vault.exportStream(carried)) {
+            yield line
+        }
+    }
+
+    const elsewhere = new Vault({ key: generateKey(), store: new MemoryStore() })
+    expect((await elsewhere.importStream(trickle(), carried)).imported).toBe(1)
+    expect(await elsewhere.open("alice", "db")).toBe("hunter2")
+})
+
+
+test("FileStore pages in order, and the pages join up", async () => {
+    const file = new FileStore(path.join(dir, "paged.vault"), KEY)
+    for (const [owner, name] of [["alice", "b"], ["alice", "a"], ["bob", "c"]] as const) {
+        await file.put(record(owner, name, 1))
+    }
+
+    const first = await file.page(null, 2)
+    expect(first.map((entry) => `${entry.owner}/${entry.name}`)).toEqual([
+        "alice/a",
+        "alice/b",
+    ])
+
+    const second = await file.page(`alice\u0000b`, 2)
+    expect(second.map((entry) => `${entry.owner}/${entry.name}`)).toEqual(["bob/c"])
+    expect(await file.page(`bob\u0000c`, 2)).toEqual([])
+})
+
+test("SqliteStore pages in order, and the pages join up", async () => {
+    const sqlite = new SqliteStore(":memory:")
+    for (const [owner, name] of [["alice", "b"], ["alice", "a"], ["bob", "c"]] as const) {
+        await sqlite.put(record(owner, name, 1))
+    }
+
+    const first = await sqlite.page(null, 2)
+    expect(first.map((entry) => `${entry.owner}/${entry.name}`)).toEqual([
+        "alice/a",
+        "alice/b",
+    ])
+
+    const second = await sqlite.page(`alice\u0000b`, 2)
+    expect(second.map((entry) => `${entry.owner}/${entry.name}`)).toEqual(["bob/c"])
+    expect(await sqlite.page(`bob\u0000c`, 2)).toEqual([])
+    sqlite.close()
+})

@@ -253,6 +253,35 @@ export class PostgresStore implements VaultStore {
     }
 
     /**
+     * One page of records, ordered by owner then name.
+     *
+     * @remarks
+     * Keyset paging on the primary key, so it stays fast however deep the walk
+     * goes and cannot skip or repeat a record because of a concurrent write.
+     *
+     * @param after The last key of the previous page as owner and name joined
+     *   by a NUL, or null to start.
+     * @param limit At most this many.
+     * @returns Up to `limit` records, in order.
+     */
+    async page(after: string | null, limit: number): Promise<SecretRecord[]> {
+        const rows = (
+            after === null
+                ? await this.sql.unsafe(
+                      `SELECT * FROM "${this.table}" ORDER BY owner, name LIMIT $1`,
+                      [limit]
+                  )
+                : await this.sql.unsafe(
+                      `SELECT * FROM "${this.table}"
+                       WHERE (owner, name) > ($1, $2)
+                       ORDER BY owner, name LIMIT $3`,
+                      [...after.split("\u0000", 2), limit]
+                  )
+        ) as Row[]
+        return rows.map(PostgresStore.toRecord)
+    }
+
+    /**
      * Writes a record only if the stored one is still at `expectedRevision`.
      *
      * @remarks

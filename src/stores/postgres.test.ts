@@ -184,6 +184,32 @@ describe.skipIf(!URL)("PostgresAuditLog", () => {
         expect(await log.entries({ until: new Date(Date.now() + 60_000) })).toHaveLength(4)
     })
 
+
+    test("it pages in order, and the pages join up", async () => {
+        const vault = new Vault({ key: generateKey(), store })
+        for (const [owner, name] of [["alice", "b"], ["alice", "a"], ["bob", "c"]] as const) {
+            await vault.put(owner, name, "x")
+        }
+
+        const first = await store.page(null, 2)
+        expect(first.map((entry) => `${entry.owner}/${entry.name}`)).toEqual([
+            "alice/a",
+            "alice/b",
+        ])
+
+        const second = await store.page(`alice\u0000b`, 2)
+        expect(second.map((entry) => `${entry.owner}/${entry.name}`)).toEqual(["bob/c"])
+        expect(await store.page(`bob\u0000c`, 2)).toEqual([])
+    })
+
+    test("a walk of a Postgres-backed vault goes through pages", async () => {
+        const vault = new Vault({ key: generateKey(), store, pageSize: 2 })
+        for (const name of ["a", "b", "c"]) await vault.put("alice", name, "x")
+
+        expect((await vault.reseal()).rekeyed).toBe(3)
+        expect(await vault.sharedWith("nobody")).toEqual([])
+    })
+
     test("a failed append stops the operation it was recording", async () => {
         // A log pointed at a table that was never created.
         const missing = new PostgresAuditLog(URL ?? "", "vault_audit_absent")

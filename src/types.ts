@@ -494,6 +494,27 @@ export type VaultStore = {
         record: SecretRecord,
         expectedRevision: number | null
     ): Promise<SecretRecord | null>
+    /**
+     * One page of records, ordered by owner then name. Optional.
+     *
+     * @remarks
+     * Implement this and the vault stops loading the whole store into memory
+     * to rekey, reseal, export, purge or answer `sharedWith` — it walks in
+     * pages instead. Without it those operations fall back to {@link
+     * VaultStore.all}, which is correct but holds everything at once.
+     *
+     * Order by `owner` then `name`, and return records strictly after
+     * `after`. Keyset paging rather than an offset, so a page cannot skip or
+     * repeat a record because something was written while the walk was in
+     * progress.
+     *
+     * @param after The last key of the previous page as `owner` and `name`
+     *   joined by a NUL, or null to start at the beginning.
+     * @param limit At most this many.
+     * @returns Up to `limit` records, in order. Fewer than `limit` means the
+     *   end.
+     */
+    page?(after: string | null, limit: number): Promise<SecretRecord[]>
 }
 
 /**

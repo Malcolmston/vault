@@ -535,6 +535,29 @@ check and the write just stays open.
 a single step, because a delete you can see is easier to live with than a write
 you cannot.
 
+## When there are a lot of them
+
+`list` hands back everything an owner has, which is right until it isn't.
+`page` walks instead:
+
+```ts
+let after: string | null = null
+do {
+    const { entries, cursor } = await vault.page("alice", { after, limit: 100 })
+    for (const entry of entries) console.log(entry.name)
+    after = cursor
+} while (after !== null)
+```
+
+Keyset paging, not an offset, so a write during the walk cannot make a page
+skip or repeat an entry.
+
+The vault's own whole-store walks — `rekey`, `reseal`, `purgeExpired`,
+`rotationDue`, `sharedWith`, `exportAll` — go through pages too, wherever the
+store implements `page`. All four shipped stores do. A custom store without it
+still works; those operations just load everything at once, as they did before
+1.6. Set the page size with `new Vault({ …, pageSize: 500 })`.
+
 ## Moving a vault
 
 `exportAll` packs everything into one sealed document, and `importAll` unpacks
@@ -558,6 +581,22 @@ memory at once, so give it a key you would give the vault itself and treat the
 document as the vault in a single string. And it refuses rather than skipping
 when a value will not open: an export that quietly dropped what it could not
 read would look like a backup right up until you needed it.
+
+For a vault that will not fit in memory, `exportStream` seals one entry per
+line and `importStream` reads them as they arrive:
+
+```ts
+const file = Bun.file("backup.txt").writer()
+for await (const line of vault.exportStream(carried)) file.write(`${line}\n`)
+await file.end()
+
+const text = await Bun.file("backup.txt").text()
+await elsewhere.importStream(text.split("\n"), carried)
+```
+
+The trade is real and worth stating: a single blob hides how many entries there
+are and how big each one is, and a line-per-entry document does not.
+`importAll` reads either format, so you only have to choose on the way out.
 
 An import leaves entries that already exist alone and names them in `skipped`,
 unless you pass `{ overwrite: true }`. Restoring a backup over a vault that has

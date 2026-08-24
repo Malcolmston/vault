@@ -42,8 +42,33 @@ export const DEFAULT_PREFIX = "@vault:"
  */
 export const DEFAULT_HISTORY_LIMIT = 5
 
+/** How many records the vault reads at a time when walking the whole store. */
+export const DEFAULT_PAGE_SIZE = 200
+
+/** One page of a listing, and where to carry on from. */
+export type Page = {
+    /** The entries on this page, by name. */
+    entries: SecretSummary[]
+    /**
+     * What to pass as `after` for the next page, or null when this was the
+     * last one.
+     */
+    cursor: string | null
+}
+
 /** What a document from {@link Vault.exportAll} starts with. */
 export const EXPORT_MAGIC = "VAULTEXPORT1"
+
+/**
+ * What a document from {@link Vault.exportStream} starts with.
+ *
+ * @remarks
+ * A second format because the first is one sealed blob, which cannot be
+ * written or read a piece at a time. This one seals each entry on its own line,
+ * so neither end has to hold the whole vault. {@link Vault.importAll} reads
+ * both.
+ */
+export const EXPORT_MAGIC_STREAM = "VAULTEXPORT2"
 
 /** What an import wrote, and what it left alone. */
 export type ImportReport = {
@@ -244,6 +269,16 @@ export type VaultOptions = {
      * @defaultValue false
      */
     strictWrites?: boolean
+    /**
+     * How many records to read at a time when walking the whole store.
+     *
+     * @remarks
+     * Only used where the store implements {@link VaultStore.page}. Larger
+     * pages mean fewer round trips and more memory held at once.
+     *
+     * @defaultValue {@link DEFAULT_PAGE_SIZE}
+     */
+    pageSize?: number
     /**
      * Where to write an audit trail that outlives the process.
      *
@@ -447,6 +482,7 @@ export class Vault {
     private readonly strictWrites: boolean
     private readonly audit: AuditLog | undefined
     private readonly auditRequired: boolean
+    private readonly pageSize: number
     /** The prefix {@link Vault.resolve} treats as a reference. */
     readonly prefix: string
 
@@ -466,6 +502,7 @@ export class Vault {
         onAccess,
         strictWrites = false,
         audit,
+        pageSize = DEFAULT_PAGE_SIZE,
     }: VaultOptions) {
         this.current = toWrapper(key)
         this.retiredWrappers = previousKeys.map(toWrapper)
@@ -479,9 +516,45 @@ export class Vault {
         const settings = audit && "log" in audit ? audit : { log: audit, required: true }
         this.audit = settings.log
         this.auditRequired = settings.required ?? true
+        this.pageSize = pageSize
     }
 
 
+
+    /**
+     * Every record in the store, a page at a time where the store can do that.
+     *
+     * @remarks
+     * What `rekey`, `reseal`, `purgeExpired`, `rotationDue`, `sharedWith` and
+     * `exportAll` walk. A store with {@link VaultStore.page} is read in pages,
+     * so none of those holds the whole vault in memory; one without falls back
+     * to {@link VaultStore.all}, which is what they all used to do.
+     *
+     * @param owner Only this owner's records, or every owner when left out.
+     * @yields Each record, ordered by owner then name when paged.
+     */
+    private async *scan(owner?: string): AsyncGenerator<SecretRecord> {
+        if (owner !== undefined) {
+            // One owner is already a bounded read; every store can do it.
+            for (const record of await this.store.list(owner)) yield record
+            return
+        }
+
+        if (!this.store.page) {
+            for (const record of await this.store.all()) yield record
+            return
+        }
+
+        let after: string | null = null
+        for (;;) {
+            const page: SecretRecord[] = await this.store.page(after, this.pageSize)
+            for (const record of page) yield record
+
+            if (page.length < this.pageSize) return
+            const last = page[page.length - 1]!
+            after = `${last.owner}\u0000${last.name}`
+        }
+    }
 
     /**
      * Reports one action to `onAccess` and, if there is one, writes it to the
@@ -919,15 +992,14 @@ export class Vault {
      * ```
      */
     async rotationDue(now = new Date()): Promise<SecretSummary[]> {
-        const records = await this.store.all()
-        return records
-            .filter((record) => {
-                const every = record.rotation?.every
-                if (!every) return false
-                const last = (record.rotatedAt ?? record.createdAt).getTime()
-                return now.getTime() - last >= every * 1000
-            })
-            .map(summarise)
+        const due: SecretSummary[] = []
+        for await (const record of this.scan()) {
+            const every = record.rotation?.every
+            if (!every) continue
+            const last = (record.rotatedAt ?? record.createdAt).getTime()
+            if (now.getTime() - last >= every * 1000) due.push(summarise(record))
+        }
+        return due
     }
 
     /**
@@ -1342,10 +1414,9 @@ export class Vault {
      * ```
      */
     async reseal(owner?: string): Promise<RekeyReport> {
-        const records = owner ? await this.store.list(owner) : await this.store.all()
         const report: RekeyReport = { rekeyed: 0, failed: [] }
 
-        for (const record of records) {
+        for await (const record of this.scan(owner)) {
             if (!record.isSealed || !record.sealed) continue
 
             try {
@@ -1402,7 +1473,7 @@ export class Vault {
         const nextWrapper = toWrapper(next)
         const report: RekeyReport = { rekeyed: 0, failed: [] }
 
-        for (const record of await this.store.all()) {
+        for await (const record of this.scan()) {
             // Entries in the open hold no key to re-seal.
             if (!record.isSealed) continue
 
@@ -1496,6 +1567,60 @@ export class Vault {
     }
 
     /**
+     * One page of an owner's entries, for listing a vault too large to hand
+     * back whole.
+     *
+     * @remarks
+     * {@link Vault.list} returns everything an owner has, which is the right
+     * answer until it is not. This walks in pages of at most `limit`, newest
+     * cursor last, and hands back the cursor to ask for the next one.
+     *
+     * Keyset paging, not an offset: a write during the walk cannot make a page
+     * skip or repeat an entry.
+     *
+     * @param owner Whose entries to list.
+     * @param options `limit` caps the page, `after` continues from a previous
+     *   one, and `where` narrows by metadata as {@link Vault.list} does.
+     * @returns The entries, and the cursor to pass as `after` next time —
+     *   null when that was the last page.
+     *
+     * @example
+     * ```ts
+     * let after: string | null = null
+     * do {
+     *     const page = await vault.page("alice", { after, limit: 100 })
+     *     for (const entry of page.entries) console.log(entry.name)
+     *     after = page.cursor
+     * } while (after !== null)
+     * ```
+     */
+    async page(
+        owner: string,
+        {
+            limit = DEFAULT_PAGE_SIZE,
+            after = null,
+            where = {},
+        }: { limit?: number; after?: string | null; where?: Record<string, string> } = {}
+    ): Promise<Page> {
+        const wanted = Object.entries(where)
+
+        const ordered = (await this.store.list(owner))
+            .filter((record) => after === null || record.name > after)
+            .filter((record) =>
+                wanted.every(([field, value]) => record.metadata[field] === value)
+            )
+            .sort((a, b) => a.name.localeCompare(b.name))
+
+        const entries = ordered.slice(0, limit).map(summarise)
+        // A full page might still be the last one; the caller finds out by
+        // asking for the next and getting nothing, which is the honest answer
+        // without a second count.
+        const cursor = entries.length < limit ? null : (entries[entries.length - 1]?.name ?? null)
+
+        return { entries, cursor }
+    }
+
+    /**
      * Packs everything into one sealed document, for moving a vault somewhere
      * else or keeping a copy off the machine.
      *
@@ -1530,39 +1655,9 @@ export class Vault {
         owner?: string
     ): Promise<string> {
         const exportKey = await toKey(key)
-        const records = owner ? await this.store.list(owner) : await this.store.all()
-
         const entries: ExportedEntry[] = []
-        for (const record of records) {
-            entries.push({
-                owner: record.owner,
-                name: record.name,
-                // Opened here, so the far end can re-seal under its own key.
-                value: record.isSealed
-                    ? await this.unseal(
-                          record.sealed,
-                          record.sealedKey,
-                          Vault.binding(record.owner, record.name)
-                      )
-                    : (record.plain ?? ""),
-                history: await Promise.all(
-                    record.history.map((entry) =>
-                        this.unseal(
-                            entry.sealed,
-                            entry.sealedKey,
-                            Vault.binding(record.owner, record.name)
-                        )
-                    )
-                ),
-                isSealed: record.isSealed,
-                isFinal: record.isFinal,
-                expiresAt: record.expiresAt,
-                rotation: record.rotation,
-                rotatedAt: record.rotatedAt,
-                metadata: record.metadata,
-                createdAt: record.createdAt,
-                updatedAt: record.updatedAt,
-            })
+        for await (const record of this.scan(owner)) {
+            entries.push(await this.exportable(record))
         }
 
         await this.record({
@@ -1572,6 +1667,89 @@ export class Vault {
             detail: `exported ${entries.length} entries`,
         })
         return `${EXPORT_MAGIC}\n${await seal(exportKey, JSON.stringify(entries))}`
+    }
+
+    /**
+     * The same export, a line at a time, for a vault too large to hold in
+     * memory.
+     *
+     * @remarks
+     * {@link Vault.exportAll} is one sealed blob, which means opening every
+     * secret at once and keeping them all until the document is built. This
+     * seals each entry on its own line, so the most either end holds is one
+     * entry — at the cost of leaking how many entries there are and roughly how
+     * big each is, which the single blob hides.
+     *
+     * Pick on that basis: `exportAll` for a vault that fits and a document that
+     * gives nothing away, this for one that does not fit.
+     *
+     * @param key What to seal the lines under: base64, an imported key, or a
+     *   provider.
+     * @param owner Only this owner's entries, or every owner when left out.
+     * @yields The magic line, then one sealed line per entry. Join with
+     *   newlines to make a document {@link Vault.importAll} will read.
+     * @throws {@link VaultKeyError} when a value will not open — as with
+     *   `exportAll`, an export that quietly dropped entries would be worse than
+     *   one that fails.
+     *
+     * @example
+     * ```ts
+     * const file = Bun.file("vault-backup.txt").writer()
+     * for await (const line of vault.exportStream(carried)) {
+     *     file.write(`${line}\n`)
+     * }
+     * await file.end()
+     * ```
+     */
+    async *exportStream(
+        key: string | CryptoKey | KeyProvider,
+        owner?: string
+    ): AsyncGenerator<string> {
+        const exportKey = await toKey(key)
+        yield EXPORT_MAGIC_STREAM
+
+        let count = 0
+        for await (const record of this.scan(owner)) {
+            yield await seal(exportKey, JSON.stringify(await this.exportable(record)))
+            count += 1
+        }
+
+        await this.record({
+            action: "open",
+            owner: owner ?? "",
+            name: null,
+            detail: `exported ${count} entries`,
+        })
+    }
+
+    /**
+     * One record as it goes into an export: opened, so the far end can re-seal
+     * it under its own key.
+     *
+     * @param record What to pack.
+     * @returns The entry, value and history in the clear.
+     * @throws {@link VaultKeyError} when a value will not open.
+     */
+    private async exportable(record: SecretRecord): Promise<ExportedEntry> {
+        const bound = Vault.binding(record.owner, record.name)
+        return {
+            owner: record.owner,
+            name: record.name,
+            value: record.isSealed
+                ? await this.unseal(record.sealed, record.sealedKey, bound)
+                : (record.plain ?? ""),
+            history: await Promise.all(
+                record.history.map((entry) => this.unseal(entry.sealed, entry.sealedKey, bound))
+            ),
+            isSealed: record.isSealed,
+            isFinal: record.isFinal,
+            expiresAt: record.expiresAt,
+            rotation: record.rotation,
+            rotatedAt: record.rotatedAt,
+            metadata: record.metadata,
+            createdAt: record.createdAt,
+            updatedAt: record.updatedAt,
+        }
     }
 
     /**
@@ -1601,51 +1779,28 @@ export class Vault {
         key: string | CryptoKey | KeyProvider,
         { overwrite = false }: { overwrite?: boolean } = {}
     ): Promise<ImportReport> {
-        const [magic, payload] = document.trim().split("\n")
-        if (magic !== EXPORT_MAGIC || !payload) {
+        const [magic, ...rest] = document.trim().split("\n")
+        const importKey = await toKey(key)
+
+        let entries: ExportedEntry[]
+        if (magic === EXPORT_MAGIC && rest[0]) {
+            entries = JSON.parse(await open(importKey, rest[0])) as ExportedEntry[]
+        } else if (magic === EXPORT_MAGIC_STREAM) {
+            // One sealed entry per line. Read whole here; `importStream` is the
+            // one that does not hold them all.
+            entries = await Promise.all(
+                rest
+                    .filter((line) => line.length > 0)
+                    .map(async (line) => JSON.parse(await open(importKey, line)) as ExportedEntry)
+            )
+        } else {
             throw new VaultKeyError("That is not a vault export.")
         }
 
-        const opened = await open(await toKey(key), payload)
-        const entries = JSON.parse(opened) as ExportedEntry[]
         const report: ImportReport = { imported: 0, skipped: [] }
 
         for (const entry of entries) {
-            const existing = await this.store.get(entry.owner, entry.name)
-            if (existing && !overwrite) {
-                report.skipped.push(`${entry.owner}/${entry.name}`)
-                continue
-            }
-
-            const bound = Vault.binding(entry.owner, entry.name)
-            const body = entry.isSealed
-                ? { ...(await this.enseal(entry.value, bound)), plain: null }
-                : { sealed: "", sealedKey: null, plain: entry.value }
-
-            // History is re-sealed too, each value under a key of its own.
-            const history = []
-            for (const value of entry.history) {
-                history.push({
-                    ...(await this.enseal(value, bound)),
-                    createdAt: new Date(entry.updatedAt),
-                })
-            }
-
-            await this.store.put({
-                owner: entry.owner,
-                name: entry.name,
-                ...body,
-                isSealed: entry.isSealed,
-                isFinal: entry.isFinal,
-                expiresAt: entry.expiresAt === null ? null : new Date(entry.expiresAt),
-                history,
-                rotation: entry.rotation,
-                rotatedAt: entry.rotatedAt === null ? null : new Date(entry.rotatedAt),
-                metadata: entry.metadata,
-                createdAt: new Date(entry.createdAt),
-                updatedAt: new Date(entry.updatedAt),
-            })
-            report.imported += 1
+            if (await this.absorb(entry, overwrite, report)) report.imported += 1
         }
 
         await this.record({
@@ -1814,20 +1969,130 @@ export class Vault {
      * ```
      */
     async sharedWith(reader: string, now = new Date()): Promise<SecretSummary[]> {
-        const records = await this.store.all()
+        const found: SecretSummary[] = []
+        for await (const record of this.scan()) {
+            if (record.owner === reader || isExpired(record, now)) continue
+            const granted = (record.shares ?? []).find((share) => share.with === reader)
+            if (!granted) continue
+            if (granted.expiresAt && granted.expiresAt <= now) continue
+            found.push(summarise(record))
+        }
 
-        return records
-            .filter((record) => {
-                if (record.owner === reader || isExpired(record, now)) return false
-                const granted = (record.shares ?? []).find((share) => share.with === reader)
-                return Boolean(granted) && !(granted!.expiresAt && granted!.expiresAt <= now)
-            })
-            .map(summarise)
+        return found
             .sort((a, b) =>
                 a.owner === b.owner
                     ? a.name.localeCompare(b.name)
                     : a.owner.localeCompare(b.owner)
             )
+    }
+
+    /**
+     * Writes one entry from an export into this vault, sealed under its key.
+     *
+     * @param entry The entry as the document carried it.
+     * @param overwrite Whether to replace an entry already here.
+     * @param report Where to note one that was left alone.
+     * @returns Whether it was written.
+     */
+    private async absorb(
+        entry: ExportedEntry,
+        overwrite: boolean,
+        report: ImportReport
+    ): Promise<boolean> {
+        const existing = await this.store.get(entry.owner, entry.name)
+        if (existing && !overwrite) {
+            report.skipped.push(`${entry.owner}/${entry.name}`)
+            return false
+        }
+
+        const bound = Vault.binding(entry.owner, entry.name)
+        const body = entry.isSealed
+            ? { ...(await this.enseal(entry.value, bound)), plain: null }
+            : { sealed: "", sealedKey: null, plain: entry.value }
+
+        // History is re-sealed too, each value under a key of its own.
+        const history = []
+        for (const value of entry.history) {
+            history.push({
+                ...(await this.enseal(value, bound)),
+                createdAt: new Date(entry.updatedAt),
+            })
+        }
+
+        await this.store.put({
+            owner: entry.owner,
+            name: entry.name,
+            ...body,
+            isSealed: entry.isSealed,
+            isFinal: entry.isFinal,
+            expiresAt: entry.expiresAt === null ? null : new Date(entry.expiresAt),
+            history,
+            rotation: entry.rotation,
+            rotatedAt: entry.rotatedAt === null ? null : new Date(entry.rotatedAt),
+            metadata: entry.metadata,
+            createdAt: new Date(entry.createdAt),
+            updatedAt: new Date(entry.updatedAt),
+        })
+        return true
+    }
+
+    /**
+     * Reads a streamed export a line at a time, so neither end holds the whole
+     * vault.
+     *
+     * @remarks
+     * The counterpart to {@link Vault.exportStream}. {@link Vault.importAll}
+     * reads the same document but collects it first; this one writes each entry
+     * as it arrives, which is what makes a vault larger than memory movable.
+     *
+     * @param lines The document's lines, magic line first, as
+     *   {@link Vault.exportStream} yielded them.
+     * @param key The key the lines were sealed under.
+     * @param options `overwrite` replaces entries that already exist.
+     * @returns What was written, and what was left alone.
+     * @throws {@link VaultKeyError} when the document is not a streamed export,
+     *   or the key does not open it.
+     *
+     * @example
+     * ```ts
+     * const text = await Bun.file("vault-backup.txt").text()
+     * const report = await vault.importStream(text.split("\n"), carried)
+     * ```
+     */
+    async importStream(
+        lines: AsyncIterable<string> | Iterable<string>,
+        key: string | CryptoKey | KeyProvider,
+        { overwrite = false }: { overwrite?: boolean } = {}
+    ): Promise<ImportReport> {
+        const importKey = await toKey(key)
+        const report: ImportReport = { imported: 0, skipped: [] }
+        let seenMagic = false
+
+        for await (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed) continue
+
+            if (!seenMagic) {
+                if (trimmed !== EXPORT_MAGIC_STREAM) {
+                    throw new VaultKeyError("That is not a streamed vault export.")
+                }
+                seenMagic = true
+                continue
+            }
+
+            const entry = JSON.parse(await open(importKey, trimmed)) as ExportedEntry
+            if (await this.absorb(entry, overwrite, report)) report.imported += 1
+        }
+
+        if (!seenMagic) throw new VaultKeyError("That is not a streamed vault export.")
+
+        await this.record({
+            action: "put",
+            owner: "",
+            name: null,
+            detail: `imported ${report.imported} entries`,
+        })
+        return report
     }
 
     /**
@@ -1853,7 +2118,13 @@ export class Vault {
      * ```
      */
     async purgeExpired(now = new Date()): Promise<number> {
-        const expired = (await this.store.all()).filter((record) => isExpired(record, now))
+        // Collected before deleting: removing records while paging through them
+        // would move the ground under the cursor.
+        const expired: SecretRecord[] = []
+        for await (const record of this.scan()) {
+            if (isExpired(record, now)) expired.push(record)
+        }
+
         for (const record of expired) {
             await this.store.remove(record.owner, record.name)
         }

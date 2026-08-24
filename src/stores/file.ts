@@ -380,6 +380,29 @@ export class FileStore implements VaultStore {
     }
 
     /**
+     * One page of records, ordered by owner then name.
+     *
+     * @remarks
+     * The whole index is in memory anyway, so this saves the store nothing —
+     * it is here so that the vault's walks hold one page at a time rather than
+     * a copy of everything.
+     *
+     * @param after The last key of the previous page, or null to start.
+     * @param limit At most this many.
+     * @returns Up to `limit` records, in order.
+     * @throws {@link VaultKeyError} if the file cannot be opened.
+     */
+    async page(after: string | null, limit: number): Promise<SecretRecord[]> {
+        const records = await this.load()
+        return [...records.values()]
+            .map((record) => ({ record, key: `${record.owner}\u0000${record.name}` }))
+            .filter(({ key }) => after === null || key > after)
+            .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+            .slice(0, limit)
+            .map(({ record }) => FileStore.copy(record))
+    }
+
+    /**
      * Writes a record only if the stored one is still at `expectedRevision`.
      *
      * @remarks
