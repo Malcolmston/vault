@@ -12,7 +12,31 @@ on:
         default: true
 
 jobs:
+  # A tag for a version the registry already has is a tag someone added after
+  # the fact — when this repository was created, say. There is nothing to
+  # publish, and failing would only cry wolf.
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.check.outputs.published }}
+    steps:
+      - id: check
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if npm view "@mstone6969/vault@${version}" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${version} is already on npm; nothing to release."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
   release:
+    needs: decide
+    if: needs.decide.outputs.published != 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
