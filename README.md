@@ -53,8 +53,7 @@ a map of non-secret strings that `list` returns as-is:
 
 ```ts
 await vault.put("alice", "deploy", privateKey, {
-    kind: "ssh",
-    publicKey: "ssh-ed25519 AAAA…",
+    metadata: { kind: "ssh", publicKey: "ssh-ed25519 AAAA…" },
 })
 
 await vault.list("alice")
@@ -64,6 +63,15 @@ await vault.list("alice")
 That is what lets a listing say what something is — which login a password
 belongs to, which public key pairs with a sealed private one — without opening
 anything. Replacing a value replaces its metadata too.
+
+A listing can be narrowed to entries whose metadata matches:
+
+```ts
+await vault.list("alice", { kind: "ssh" })
+```
+
+Only metadata, because it is the only part kept in the clear. Filtering on a
+value would mean opening every secret in the vault to answer a listing.
 
 It is stored in the clear. Put nothing in it you would not show.
 
@@ -154,7 +162,7 @@ The key never leaves your process, and the package never writes it anywhere.
 An entry can be more than a value:
 
 ```ts
-await vault.put("alice", "region", "eu-west-1", { open: true })   // readable
+await vault.put("alice", "region", "eu-west-1", { sealed: false }) // readable
 await vault.put("alice", "root_ca", pem, { final: true })         // written once
 await vault.put("alice", "token", value, { expiresAt: tomorrow }) // stops working
 await vault.rotate("alice", "deploy", next)                       // keeps the old one
@@ -225,7 +233,17 @@ comparable between two copies of the database.
 new Vault({ key: envKey("VAULT_KEY"), store })    // an environment variable
 new Vault({ key: fileKey("/etc/vault.key"), store })  // a file
 new Vault({ key: staticKey(material), store })    // one you already have
+new Vault({ key: passphraseKey(phrase, salt), store })  // something remembered
 ```
+
+`passphraseKey` stretches a passphrase into a key with PBKDF2-HMAC-SHA256,
+600,000 iterations by default — deliberately slow, so that guessing at the
+passphrase costs the guesser real time. The salt is not a secret and does not
+have to be hidden, but it does have to be the same one every time, or the key
+comes out different and nothing opens. Keep it beside the vault.
+
+A passphrase is only ever as good as the passphrase. Prefer a generated key
+where you have somewhere to keep one.
 
 A provider is one method — write your own for a KMS or anything else. It is
 called the first time a key is actually needed, not when the vault is built, so
@@ -268,6 +286,34 @@ and named in `failed` — re-sealing what cannot be read would only destroy it.
 > [!WARNING]
 > Losing every key loses every value sealed under them. Rekey before you retire
 > a key, and back the current one up where you would back up a password.
+
+## Moving a vault
+
+`exportAll` packs everything into one sealed document, and `importAll` unpacks
+it somewhere else:
+
+```ts
+const carried = generateKey()
+await Bun.write("backup.txt", await vault.exportAll(carried))
+
+// on the other machine, in a vault with a master key of its own
+const report = await elsewhere.importAll(await Bun.file("backup.txt").text(), carried)
+// { imported: 42, skipped: [] }
+```
+
+Values are opened and re-sealed under the key you pass, rather than copied
+across as they are — which is what lets the far end have a different master key.
+Metadata, expiry, rotation policies, finality and history come too.
+
+Two things follow from that. It is the one operation that holds every secret in
+memory at once, so give it a key you would give the vault itself and treat the
+document as the vault in a single string. And it refuses rather than skipping
+when a value will not open: an export that quietly dropped what it could not
+read would look like a backup right up until you needed it.
+
+An import leaves entries that already exist alone and names them in `skipped`,
+unless you pass `{ overwrite: true }`. Restoring a backup over a vault that has
+moved on should not silently undo the newer values.
 
 ## API reference
 

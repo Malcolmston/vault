@@ -1,5 +1,5 @@
 import { generateKey, importKey, open, seal } from "./crypto"
-import { VaultError } from "./errors"
+import { VaultError, VaultKeyError } from "./errors"
 import { isKeyProvider, staticKey, type KeyProvider } from "./providers"
 import type {
     PutOptions,
@@ -33,6 +33,17 @@ export const DEFAULT_PREFIX = "@vault:"
  * @see {@link VaultOptions.historyLimit}
  */
 export const DEFAULT_HISTORY_LIMIT = 5
+
+/** What a document from {@link Vault.exportAll} starts with. */
+export const EXPORT_MAGIC = "VAULTEXPORT1"
+
+/** What an import wrote, and what it left alone. */
+export type ImportReport = {
+    /** How many entries were written. */
+    imported: number
+    /** Entries already present and left as they were, by `owner/name`. */
+    skipped: string[]
+}
 
 const NAME_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/
 
@@ -230,6 +241,22 @@ function summarise(record: SecretRecord): SecretSummary {
     return summary
 }
 
+/** One entry inside an export document: opened, so it can be re-sealed. */
+type ExportedEntry = {
+    owner: string
+    name: string
+    value: string
+    history: string[]
+    isSealed: boolean
+    isFinal: boolean
+    expiresAt: string | Date | null
+    rotation: SecretRecord["rotation"]
+    rotatedAt: string | Date | null
+    metadata: Record<string, string>
+    createdAt: string | Date
+    updatedAt: string | Date
+}
+
 function isExpired(record: SecretRecord, now: Date): boolean {
     return record.expiresAt !== null && record.expiresAt.getTime() <= now.getTime()
 }
@@ -389,10 +416,23 @@ export class Vault {
      * ```
      *
      * @see {@link SecretSummary}
+     * @param where Metadata every returned entry must match exactly. Only
+     *   metadata, because it is the only part kept in the clear — filtering on
+     *   a value would mean opening every secret to answer a listing.
      */
-    async list(owner: string): Promise<SecretSummary[]> {
+    async list(
+        owner: string,
+        where: Record<string, string> = {}
+    ): Promise<SecretSummary[]> {
+        const wanted = Object.entries(where)
         const records = await this.store.list(owner)
-        return records.map(summarise).sort((a, b) => a.name.localeCompare(b.name))
+
+        return records
+            .filter((record) =>
+                wanted.every(([field, value]) => record.metadata[field] === value)
+            )
+            .map(summarise)
+            .sort((a, b) => a.name.localeCompare(b.name))
     }
 
     /**
@@ -950,6 +990,157 @@ export class Vault {
                 return { ...entry, sealedKey: await seal(nextKey, material) }
             })
         )
+    }
+
+    /**
+     * Packs everything into one sealed document, for moving a vault somewhere
+     * else or keeping a copy off the machine.
+     *
+     * @remarks
+     * Values are opened and re-sealed under `key`, not copied across as they
+     * are — so the document can be imported into a vault with a different
+     * master key, which is the point of having one. Metadata, expiry, rotation
+     * policies and history come too.
+     *
+     * That also means this is the one operation that holds every secret in
+     * memory at once. Give it a key you would give the vault itself, and treat
+     * what comes back as the vault in a single string.
+     *
+     * @param key What to seal the document under: base64, an imported key, or a
+     *   provider.
+     * @param owner Only this owner's entries, or every owner when left out.
+     * @returns A document beginning with {@link EXPORT_MAGIC}.
+     * @throws {@link VaultKeyError} when a value will not open under any key
+     *   this vault holds — an export that quietly dropped entries would be
+     *   worse than one that fails.
+     *
+     * @example
+     * ```ts
+     * import { generateKey } from "@mstone6969/vault"
+     *
+     * const carried = generateKey()
+     * await Bun.write("vault-backup.txt", await vault.exportAll(carried))
+     * ```
+     */
+    async exportAll(
+        key: string | CryptoKey | KeyProvider,
+        owner?: string
+    ): Promise<string> {
+        const exportKey = await toKey(key)
+        const records = owner ? await this.store.list(owner) : await this.store.all()
+
+        const entries: ExportedEntry[] = []
+        for (const record of records) {
+            entries.push({
+                owner: record.owner,
+                name: record.name,
+                // Opened here, so the far end can re-seal under its own key.
+                value: record.isSealed
+                    ? await this.unseal(record.sealed, record.sealedKey)
+                    : (record.plain ?? ""),
+                history: await Promise.all(
+                    record.history.map((entry) => this.unseal(entry.sealed, entry.sealedKey))
+                ),
+                isSealed: record.isSealed,
+                isFinal: record.isFinal,
+                expiresAt: record.expiresAt,
+                rotation: record.rotation,
+                rotatedAt: record.rotatedAt,
+                metadata: record.metadata,
+                createdAt: record.createdAt,
+                updatedAt: record.updatedAt,
+            })
+        }
+
+        this.record({
+            action: "open",
+            owner: owner ?? "",
+            name: null,
+            detail: `exported ${entries.length} entries`,
+        })
+        return `${EXPORT_MAGIC}\n${await seal(exportKey, JSON.stringify(entries))}`
+    }
+
+    /**
+     * Unpacks a document from {@link Vault.exportAll} into this vault, sealing
+     * every value under this vault's master key.
+     *
+     * @remarks
+     * Entries already here are left alone unless `overwrite` says otherwise,
+     * and named in the report — importing a backup over a vault that has moved
+     * on should not quietly undo the newer values.
+     *
+     * @param document What {@link Vault.exportAll} produced.
+     * @param key The key that document was sealed under.
+     * @param options `overwrite` replaces entries that already exist.
+     * @returns What was written, and what was left alone.
+     * @throws {@link VaultKeyError} when the document is not one of ours, or
+     *   the key does not open it.
+     *
+     * @example
+     * ```ts
+     * const report = await vault.importAll(backup, carried)
+     * // { imported: 42, skipped: ["alice/db"] }
+     * ```
+     */
+    async importAll(
+        document: string,
+        key: string | CryptoKey | KeyProvider,
+        { overwrite = false }: { overwrite?: boolean } = {}
+    ): Promise<ImportReport> {
+        const [magic, payload] = document.trim().split("\n")
+        if (magic !== EXPORT_MAGIC || !payload) {
+            throw new VaultKeyError("That is not a vault export.")
+        }
+
+        const opened = await open(await toKey(key), payload)
+        const entries = JSON.parse(opened) as ExportedEntry[]
+        const report: ImportReport = { imported: 0, skipped: [] }
+
+        for (const entry of entries) {
+            const existing = await this.store.get(entry.owner, entry.name)
+            if (existing && !overwrite) {
+                report.skipped.push(`${entry.owner}/${entry.name}`)
+                continue
+            }
+
+            const body = entry.isSealed
+                ? { ...(await this.enseal(entry.value)), plain: null }
+                : { sealed: "", sealedKey: null, plain: entry.value }
+
+            // History is re-sealed too, each value under a key of its own.
+            const history = []
+            for (const value of entry.history) {
+                history.push({
+                    ...(await this.enseal(value)),
+                    createdAt: new Date(entry.updatedAt),
+                })
+            }
+
+            await this.store.put({
+                owner: entry.owner,
+                name: entry.name,
+                ...body,
+                isSealed: entry.isSealed,
+                isFinal: entry.isFinal,
+                expiresAt: entry.expiresAt === null ? null : new Date(entry.expiresAt),
+                history,
+                rotation: entry.rotation,
+                rotatedAt: entry.rotatedAt === null ? null : new Date(entry.rotatedAt),
+                metadata: entry.metadata,
+                createdAt: new Date(entry.createdAt),
+                updatedAt: new Date(entry.updatedAt),
+            })
+            report.imported += 1
+        }
+
+        this.record({
+            action: "put",
+            owner: "",
+            name: null,
+            detail: `imported ${report.imported} entries`,
+        })
+        return report
     }
 
     /**

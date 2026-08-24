@@ -8,6 +8,33 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 1.1.0 — 2026-08-23
+
+Additive. Nothing published before this keeps working differently.
+
+### Added
+
+- `exportAll` / `importAll`: the whole vault as one sealed document. Values are
+  opened and re-sealed under the key you pass rather than copied across, so the
+  far end can have a master key of its own — metadata, expiry, rotation
+  policies, finality and history come with them. An export refuses when a value
+  will not open, rather than dropping it: a backup missing entries would look
+  fine right up until it was needed. An import leaves entries that already exist
+  alone and names them, unless told to overwrite.
+- `passphraseKey(passphrase, salt)`: a master key stretched from a passphrase
+  with PBKDF2-HMAC-SHA256, 600,000 iterations by default.
+- `list(owner, where)` narrows a listing to entries whose metadata matches.
+  Metadata only — filtering on a value would mean opening every secret in the
+  vault to answer a listing.
+
+### Fixed
+
+- Two README examples predated the release that changed them: `put`'s fourth
+  argument had been shown as bare metadata since 0.5.0 made it an options
+  object, and `{ open: true }` since 1.0.0 renamed it to `{ sealed: false }`.
+  Both would have thrown or silently done nothing. Every example in the README
+  is now run before release.
+
 ## 1.0.0 — 2026-08-24
 
 The surface is settled. What it covers and what a change to it costs is in the

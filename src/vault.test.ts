@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { generateKey, importKey, open, seal } from "./crypto"
 import { VaultError, VaultKeyError } from "./errors"
-import { envKey, fileKey, isKeyProvider, staticKey } from "./providers"
+import { envKey, fileKey, isKeyProvider, passphraseKey, staticKey } from "./providers"
 import { FileStore } from "./stores/file"
 import { MemoryStore } from "./stores/memory"
 import { SqliteStore } from "./stores/sqlite"
@@ -1100,4 +1100,172 @@ test("the timestamp a rotation reports is the one it stored", async () => {
     const [stored] = await vault.list("alice")
     expect(stored).toBeDefined()
     expect(rotated.rotatedAt).toEqual(stored!.rotatedAt)
+})
+
+// --- passphrase keys ------------------------------------------------------
+
+test("a passphrase becomes a key, and the same one every time", async () => {
+    // Few rounds here: the point is the shape, not the grinding.
+    const key = passphraseKey("correct horse battery staple", "a-salt", 1_000)
+    const vault = new Vault({ key, store })
+
+    await vault.put("alice", "token", "value")
+    expect(await vault.open("alice", "token")).toBe("value")
+
+    // A vault built again from the same passphrase and salt opens it.
+    const again = new Vault({
+        key: passphraseKey("correct horse battery staple", "a-salt", 1_000),
+        store,
+    })
+    expect(await again.open("alice", "token")).toBe("value")
+})
+
+test("a different passphrase, salt or cost gives a different key", async () => {
+    const material = async (passphrase: string, salt: string, rounds = 1_000) =>
+        passphraseKey(passphrase, salt, rounds).key()
+
+    const base = await material("passphrase", "salt")
+    expect(await material("passphrase", "salt")).toBe(base)
+    expect(await material("different", "salt")).not.toBe(base)
+    expect(await material("passphrase", "different")).not.toBe(base)
+    expect(await material("passphrase", "salt", 2_000)).not.toBe(base)
+
+    expect(Buffer.from(base as string, "base64")).toHaveLength(32)
+})
+
+test("an empty passphrase or salt is refused, not quietly accepted", async () => {
+    await expect(passphraseKey("", "salt", 1_000).key()).rejects.toThrow(/cannot be empty/)
+    await expect(passphraseKey("passphrase", "", 1_000).key()).rejects.toThrow(/needs a salt/)
+})
+
+// --- export and import ----------------------------------------------------
+
+test("an export moves a vault to a different master key", async () => {
+    await vault.put("alice", "token", "value", {
+        metadata: { kind: "api" },
+        rotation: { kind: "random", length: 12 },
+    })
+    await vault.rotate("alice", "token", "rotated")
+    await vault.put("alice", "config", "eu-west-1", { sealed: false })
+    await vault.put("alice", "locked", "once", { final: true })
+    await vault.put("bob", "his", "own")
+
+    const carried = generateKey()
+    const document = await vault.exportAll(carried)
+    expect(document.startsWith("VAULTEXPORT1\n")).toBe(true)
+    expect(document).not.toContain("rotated")
+    expect(document).not.toContain("alice")
+
+    // A vault that has never seen the original key takes it whole.
+    const elsewhere = new Vault({ key: generateKey(), store: new MemoryStore() })
+    expect(await elsewhere.importAll(document, carried)).toEqual({
+        imported: 4,
+        skipped: [],
+    })
+
+    expect(await elsewhere.open("alice", "token")).toBe("rotated")
+    expect(await elsewhere.versions("alice", "token")).toEqual(["value"])
+    expect(await elsewhere.read("alice", "config")).toBe("eu-west-1")
+    expect(await elsewhere.open("bob", "his")).toBe("own")
+
+    const listed = await elsewhere.list("alice")
+    const token = listed.find((entry) => entry.name === "token")
+    expect(token?.metadata).toEqual({ kind: "api" })
+    expect(token?.rotation).toEqual({ kind: "random", length: 12 })
+
+    // Finality came across, so the entry is still write-once.
+    await expect(elsewhere.put("alice", "locked", "again")).rejects.toThrow(/final/)
+})
+
+test("an export can be limited to one owner", async () => {
+    await vault.put("alice", "hers", "one")
+    await vault.put("bob", "his", "two")
+
+    const carried = generateKey()
+    const elsewhere = new Vault({ key: generateKey(), store: new MemoryStore() })
+    await elsewhere.importAll(await vault.exportAll(carried, "alice"), carried)
+
+    expect(await elsewhere.list("alice")).toHaveLength(1)
+    expect(await elsewhere.list("bob")).toHaveLength(0)
+})
+
+test("importing leaves what is already there alone unless told otherwise", async () => {
+    await vault.put("alice", "token", "original")
+    const carried = generateKey()
+    const document = await vault.exportAll(carried)
+
+    // The vault moved on after the backup was taken.
+    await vault.put("alice", "token", "newer")
+
+    expect(await vault.importAll(document, carried)).toEqual({
+        imported: 0,
+        skipped: ["alice/token"],
+    })
+    expect(await vault.open("alice", "token")).toBe("newer")
+
+    expect(await vault.importAll(document, carried, { overwrite: true })).toEqual({
+        imported: 1,
+        skipped: [],
+    })
+    expect(await vault.open("alice", "token")).toBe("original")
+})
+
+test("a document that is not an export, or will not open, is refused", async () => {
+    await expect(vault.importAll("just some text", KEY)).rejects.toThrow(/not a vault export/)
+    await expect(vault.importAll("VAULTEXPORT1\n", KEY)).rejects.toThrow(/not a vault export/)
+
+    const document = await vault.exportAll(generateKey())
+    await expect(vault.importAll(document, generateKey())).rejects.toThrow(VaultKeyError)
+})
+
+test("an export refuses rather than silently dropping what it cannot open", async () => {
+    const stranger = await importKey(generateKey())
+    await store.put({
+        owner: "alice",
+        name: "stranger",
+        sealed: await seal(stranger, "unreachable"),
+        sealedKey: await seal(stranger, generateKey()),
+        plain: null,
+        isSealed: true,
+        isFinal: false,
+        expiresAt: null,
+        history: [],
+        rotation: null,
+        rotatedAt: null,
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+    })
+
+    await expect(vault.exportAll(generateKey())).rejects.toThrow(VaultKeyError)
+})
+
+test("an export survives a round trip through every store", async () => {
+    const carried = generateKey()
+    for (const [name, make] of storesUnder(dir)) {
+        const source = new Vault({ key: KEY, store: make() })
+        await source.put("alice", "token", "value", { metadata: { kind: "a" } })
+
+        const destination = new Vault({ key: generateKey(), store: make() })
+        await destination.importAll(await source.exportAll(carried), carried)
+
+        expect(await destination.open("alice", "token"), name).toBe("value")
+        expect((await destination.list("alice"))[0]?.metadata, name).toEqual({ kind: "a" })
+    }
+})
+
+// --- listing --------------------------------------------------------------
+
+test("a listing can be narrowed by metadata", async () => {
+    await vault.put("alice", "one", "x", { metadata: { kind: "apiKey", env: "prod" } })
+    await vault.put("alice", "two", "y", { metadata: { kind: "apiKey", env: "dev" } })
+    await vault.put("alice", "three", "z", { metadata: { kind: "login", env: "prod" } })
+
+    const names = async (where?: Record<string, string>) =>
+        (await vault.list("alice", where)).map((entry) => entry.name)
+
+    expect(await names()).toEqual(["one", "three", "two"])
+    expect(await names({ kind: "apiKey" })).toEqual(["one", "two"])
+    expect(await names({ kind: "apiKey", env: "prod" })).toEqual(["one"])
+    expect(await names({ kind: "nothing" })).toEqual([])
 })

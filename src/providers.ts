@@ -137,6 +137,81 @@ export function fileKey(path: string): KeyProvider {
 }
 
 /**
+ * How hard a passphrase is to grind through, in PBKDF2 iterations.
+ *
+ * @remarks
+ * OWASP's floor for PBKDF2-HMAC-SHA256. Raising it costs the legitimate holder
+ * one derivation at startup and costs an attacker the same multiple on every
+ * guess, so raise it if you can afford the wait.
+ */
+export const PASSPHRASE_ITERATIONS = 600_000
+
+/**
+ * A key derived from a passphrase, for when a person has to remember it.
+ *
+ * @remarks
+ * The vault wants 32 random bytes; people do not remember those. This grinds a
+ * passphrase into them with PBKDF2-HMAC-SHA256, which is only ever as strong as
+ * the passphrase — a guessable one stays guessable however many iterations you
+ * run. Prefer {@link fileKey} or {@link envKey} for anything a machine can hold
+ * for you.
+ *
+ * The salt is not a secret, but it must be the same every time or the key comes
+ * out different and nothing opens. Store it beside the vault, not inside it.
+ *
+ * Derivation happens once, the first time a key is needed, so the cost is paid
+ * at startup rather than per operation.
+ *
+ * @param passphrase What the person types.
+ * @param salt A stable, per-vault string. A UUID written down at setup is fine.
+ * @param iterations How many rounds to grind.
+ *   @defaultValue {@link PASSPHRASE_ITERATIONS}
+ * @returns A provider that derives the key.
+ * @throws {@link VaultKeyError} when the passphrase or salt is empty — both are
+ *   mistakes that would otherwise produce a perfectly usable key protecting
+ *   nothing.
+ *
+ * @example
+ * ```ts
+ * import { Vault, FileStore, passphraseKey } from "@mstone6969/vault"
+ *
+ * const key = passphraseKey(await prompt("Passphrase:"), "9f2c…the vault's salt")
+ * const vault = new Vault({ key, store: new FileStore("./secrets.vault", key) })
+ * ```
+ */
+export function passphraseKey(
+    passphrase: string,
+    salt: string,
+    iterations: number = PASSPHRASE_ITERATIONS
+): KeyProvider {
+    return {
+        async key() {
+            if (!passphrase) throw new VaultKeyError("A passphrase cannot be empty.")
+            if (!salt) throw new VaultKeyError("A passphrase needs a salt to go with it.")
+
+            const material = await crypto.subtle.importKey(
+                "raw",
+                new TextEncoder().encode(passphrase),
+                "PBKDF2",
+                false,
+                ["deriveBits"]
+            )
+            const bits = await crypto.subtle.deriveBits(
+                {
+                    name: "PBKDF2",
+                    salt: new TextEncoder().encode(salt),
+                    iterations,
+                    hash: "SHA-256",
+                },
+                material,
+                256
+            )
+            return Buffer.from(bits).toString("base64")
+        },
+    }
+}
+
+/**
  * True when something is a provider rather than a key.
  *
  * {@link Vault} and {@link FileStore} accept either, and use this to tell them
