@@ -2627,3 +2627,123 @@ test("SqliteStore pages in order, and the pages join up", async () => {
     expect(await sqlite.page(`bob\u0000c`, 2)).toEqual([])
     sqlite.close()
 })
+
+
+// --- bytes ----------------------------------------------------------------
+
+test("bytes go in and come back out unchanged", async () => {
+    const bytes = new Uint8Array([0, 1, 2, 250, 251, 255, 0])
+    await vault.putBytes("alice", "tls-key", bytes)
+
+    expect(await vault.openBytes("alice", "tls-key")).toEqual(bytes)
+})
+
+test("an entry of bytes is marked as such, in the clear", async () => {
+    await vault.putBytes("alice", "cert", new Uint8Array([1, 2, 3]))
+    const [entry] = await vault.list("alice")
+
+    expect(entry?.metadata["@vault:bytes"]).toBe("base64")
+})
+
+test("opening bytes as text, or text as bytes, is refused", async () => {
+    await vault.putBytes("alice", "cert", new Uint8Array([1, 2, 3]))
+    await vault.put("alice", "password", "hunter2")
+
+    // Text read as bytes would decode to noise, which is worse than an error.
+    await expect(vault.openBytes("alice", "password")).rejects.toThrow(/holds text, not bytes/)
+    // The other way round is legible, so it is allowed — it is just base64.
+    expect(await vault.open("alice", "cert")).toBe("AQID")
+})
+
+test("bytes cannot be stored in the open", async () => {
+    await expect(
+        vault.putBytes("alice", "cert", new Uint8Array([1]), { sealed: false })
+    ).rejects.toThrow(/cannot be stored in the open/)
+})
+
+test("empty bytes are refused like an empty value", async () => {
+    await expect(vault.putBytes("alice", "cert", new Uint8Array([]))).rejects.toThrow(
+        /needs a value/
+    )
+})
+
+test("bytes keep their metadata, expiry and rotation like anything else", async () => {
+    const expires = new Date(Date.now() + 60_000)
+    await vault.putBytes("alice", "cert", new Uint8Array([1, 2, 3]), {
+        metadata: { kind: "tls" },
+        expiresAt: expires,
+    })
+
+    const [entry] = await vault.list("alice")
+    expect(entry?.metadata.kind).toBe("tls")
+    expect(entry?.expiresAt?.getTime()).toBe(expires.getTime())
+})
+
+test("bytes can be shared, and read by the owner they were shared with", async () => {
+    const bytes = new Uint8Array([9, 8, 7])
+    await vault.putBytes("alice", "cert", bytes)
+    await vault.share("alice", "cert", { with: "bob" })
+
+    expect(await vault.openBytes("bob", "cert", { from: "alice" })).toEqual(bytes)
+})
+
+test("a large value survives the round trip byte for byte", async () => {
+    const bytes = crypto.getRandomValues(new Uint8Array(64 * 1024))
+    await vault.putBytes("alice", "keyfile", bytes)
+
+    expect(await vault.openBytes("alice", "keyfile")).toEqual(bytes)
+})
+
+// --- references inside strings --------------------------------------------
+
+test("a reference can sit inside a longer string", async () => {
+    await vault.put("alice", "db_password", "hunter2")
+
+    expect(
+        await vault.resolve("alice", {
+            DSN: "postgres://app:@vault:db_password@db.internal:5432/app",
+        })
+    ).toEqual({ DSN: "postgres://app:hunter2@db.internal:5432/app" })
+})
+
+test("several references in one string are all substituted", async () => {
+    await vault.put("alice", "user", "ada")
+    await vault.put("alice", "pass", "hunter2")
+
+    expect(
+        await vault.resolve("alice", { DSN: "postgres://@vault:user:@vault:pass@host/db" })
+    ).toEqual({ DSN: "postgres://ada:hunter2@host/db" })
+})
+
+test("a reference inside a string can name a shared secret", async () => {
+    await vault.put("alice", "db", "hunter2")
+    await vault.share("alice", "db", { with: "bob" })
+
+    expect(
+        await vault.resolve("bob", { DSN: "postgres://app:@vault:alice/db@host/db" })
+    ).toEqual({ DSN: "postgres://app:hunter2@host/db" })
+})
+
+test("a string with no reference in it is handed straight back", async () => {
+    const values = { DSN: "postgres://app@host/db" }
+    expect(await vault.resolve("alice", values)).toBe(values)
+})
+
+test("a reference inside a string that names nothing still throws", async () => {
+    await expect(
+        vault.resolve("alice", { DSN: "postgres://app:@vault:absent@host/db" })
+    ).rejects.toThrow(VaultError)
+})
+
+test("the prefix on its own, with nothing after it, is left alone", async () => {
+    expect(await vault.resolve("alice", { V: "@vault:" })).toEqual({ V: "@vault:" })
+})
+
+test("a custom prefix works inside a string too, regex characters and all", async () => {
+    const odd = new Vault({ key: KEY, store, prefix: "$(" })
+    await odd.put("alice", "token", "secret")
+
+    expect(await odd.resolve("alice", { V: "before $(token after" })).toEqual({
+        V: "before secret after",
+    })
+})

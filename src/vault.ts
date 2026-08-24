@@ -45,6 +45,25 @@ export const DEFAULT_HISTORY_LIMIT = 5
 /** How many records the vault reads at a time when walking the whole store. */
 export const DEFAULT_PAGE_SIZE = 200
 
+/**
+ * The metadata key marking an entry as bytes rather than text.
+ *
+ * @remarks
+ * In the metadata rather than a field of its own so that every store already
+ * carries it, including one written against an older version. It is in the
+ * clear, like all metadata — that an entry holds bytes is not a secret.
+ */
+export const BYTES_MARKER = "@vault:bytes"
+
+/**
+ * What ends a name inside a longer string.
+ *
+ * @remarks
+ * Anything outside the characters a name may contain. Used to tell a string
+ * that *is* a reference from one that merely holds some.
+ */
+const NAME_END = /[^A-Za-z0-9._/-]/
+
 /** One page of a listing, and where to carry on from. */
 export type Page = {
     /** The entries on this page, by name. */
@@ -885,6 +904,84 @@ export class Vault {
     }
 
     /**
+     * Stores bytes rather than text — a certificate, a keyfile, a kubeconfig.
+     *
+     * @remarks
+     * Values are text underneath, so this base64s on the way in and
+     * {@link Vault.openBytes} decodes on the way out. Doing it here rather than
+     * leaving it to every caller means one encoding rather than several, and
+     * `openBytes` refuses a value that was not written this way instead of
+     * handing back plausible-looking rubbish.
+     *
+     * Everything else about the entry works the same: metadata, expiry,
+     * rotation, sharing, history.
+     *
+     * @param owner Whose entry it is.
+     * @param name What to call it.
+     * @param value The bytes.
+     * @param options As {@link Vault.put}. `sealed: false` is refused — bytes
+     *   kept in the clear would be base64 in the database and read back as
+     *   text, which is a trap rather than a feature.
+     * @returns The entry, summarised.
+     * @throws {@link VaultError} 422 when asked to store bytes in the open, or
+     *   when the name is not a legal one.
+     * @throws {@link VaultError} 409 when the entry is final.
+     *
+     * @example
+     * ```ts
+     * await vault.putBytes("alice", "tls-key", await Bun.file("tls.key").bytes())
+     * const key = await vault.openBytes("alice", "tls-key")
+     * ```
+     */
+    async putBytes(
+        owner: string,
+        name: string,
+        value: Uint8Array,
+        options: PutOptions = {}
+    ): Promise<SecretSummary> {
+        if (options.sealed === false) {
+            throw new VaultError(
+                "Bytes cannot be stored in the open: they would be base64 in the " +
+                    "database and come back as text."
+            )
+        }
+        if (value.length === 0) throw new VaultError("A secret needs a value.")
+
+        return this.put(owner, name, Buffer.from(value).toString("base64"), {
+            ...options,
+            metadata: { ...(options.metadata ?? {}), [BYTES_MARKER]: "base64" },
+        })
+    }
+
+    /**
+     * Reads back what {@link Vault.putBytes} stored.
+     *
+     * @param owner Whose entry it is.
+     * @param name The entry to open.
+     * @param access `from` to read something another owner shared.
+     * @returns The bytes.
+     * @throws {@link VaultError} 404 when there is no such entry.
+     * @throws {@link VaultError} 410 when it has expired.
+     * @throws {@link VaultError} 415 when the entry holds text rather than
+     *   bytes — better than base64-decoding a password and returning noise.
+     * @throws {@link VaultError} 403 when it belongs to somebody who has not
+     *   shared it.
+     */
+    async openBytes(owner: string, name: string, access: Access = {}): Promise<Uint8Array> {
+        const clean = this.checkName(name)
+        const record = await this.reach(owner, clean, access.from)
+
+        if (record.metadata[BYTES_MARKER] === undefined) {
+            throw new VaultError(
+                `"${clean}" holds text, not bytes. Use open() for it.`,
+                415
+            )
+        }
+
+        return new Uint8Array(Buffer.from(await this.open(owner, clean, access), "base64"))
+    }
+
+    /**
      * Replaces a value, keeping the one it replaces.
      *
      * Called without a value, the entry's rotation policy produces one — which
@@ -1319,6 +1416,69 @@ export class Vault {
     }
 
     /**
+     * Swaps every reference in one string for the secret it names.
+     *
+     * @remarks
+     * A whole-string reference is handed back as the value itself, so a
+     * reference is not forced through string conversion. Anything else — a
+     * reference inside a connection string, a header, a URL — is substituted in
+     * place.
+     *
+     * @param owner Whose secrets a reference may name.
+     * @param value The string to substitute into.
+     * @returns The string with its references replaced, or the same string when
+     *   it holds none.
+     */
+    private async interpolate(owner: string, value: string): Promise<string> {
+        if (!value.includes(this.prefix)) return value
+
+        // The whole string is one reference: hand back the value itself rather
+        // than a copy of it, which is what every version before 1.7 did.
+        const whole = value.trim()
+        if (whole.startsWith(this.prefix)) {
+            // Trimmed before testing: whitespace around the name has always
+            // been ignored, so "@vault: token " is still one whole reference.
+            const named = whole.slice(this.prefix.length).trim()
+            if (named.length > 0 && !NAME_END.test(named)) return this.lookup(owner, named)
+        }
+
+        const pattern = new RegExp(
+            `${this.prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([A-Za-z0-9._/-]+)`,
+            "g"
+        )
+
+        let out = ""
+        let last = 0
+        for (const found of value.matchAll(pattern)) {
+            out += value.slice(last, found.index)
+            out += await this.lookup(owner, found[1]!)
+            last = found.index + found[0].length
+        }
+
+        return out + value.slice(last)
+    }
+
+    /**
+     * The secret one reference names, whoever it belongs to.
+     *
+     * @remarks
+     * `alice/token` reaches a secret alice shared; `token` is the caller's own.
+     * A name cannot contain a slash, so the two forms never collide.
+     *
+     * @param owner Who is asking.
+     * @param reference What followed the prefix.
+     * @returns The value.
+     */
+    private async lookup(owner: string, reference: string): Promise<string> {
+        const wanted = reference.trim()
+        const slash = wanted.indexOf("/")
+
+        return slash === -1
+            ? this.open(owner, wanted)
+            : this.open(owner, wanted.slice(slash + 1), { from: wanted.slice(0, slash) })
+    }
+
+    /**
      * Walks a value, swapping references for secrets as it goes.
      *
      * @param owner Whose secrets a reference may name.
@@ -1334,21 +1494,7 @@ export class Vault {
         value: unknown,
         seen: WeakSet<object>
     ): Promise<unknown> {
-        if (typeof value === "string") {
-            if (!value.startsWith(this.prefix)) return value
-
-            // "@vault:alice/token" reaches a secret alice shared; "@vault:token"
-            // is the caller's own. A slash cannot appear in a name, so the two
-            // forms can never be confused for one another.
-            const reference = value.slice(this.prefix.length).trim()
-            const slash = reference.indexOf("/")
-
-            return slash === -1
-                ? this.open(owner, reference)
-                : this.open(owner, reference.slice(slash + 1), {
-                      from: reference.slice(0, slash),
-                  })
-        }
+        if (typeof value === "string") return this.interpolate(owner, value)
 
         if (value === null || typeof value !== "object") return value
 

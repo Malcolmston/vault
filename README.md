@@ -88,6 +88,16 @@ await vault.resolve("alice", {
 // { NODE_ENV: "production", API_KEY: "sk_live_…" }
 ```
 
+A reference can also sit inside a longer string, which is what connection
+strings need:
+
+```ts
+await vault.resolve("alice", {
+    DSN: "postgres://app:@vault:db_password@db.internal:5432/app",
+})
+// { DSN: "postgres://app:hunter2@db.internal:5432/app" }
+```
+
 References work anywhere in a structure, not only at the top:
 
 ```ts
@@ -104,6 +114,24 @@ all is handed back rather than copied.
 A reference to a secret that isn't there **throws**. Running a job with a blank
 credential is worse than not running it. Change the prefix with
 `new Vault({ …, prefix: "secret://" })`.
+
+## Bytes
+
+A certificate, a keyfile, a kubeconfig — anything that is not text:
+
+```ts
+await vault.putBytes("alice", "tls-key", await Bun.file("tls.key").bytes())
+const key = await vault.openBytes("alice", "tls-key")
+```
+
+Values are text underneath, so this base64s on the way in and decodes on the
+way out — one encoding rather than one per caller. The entry is marked as bytes
+in its metadata, so `openBytes` refuses an entry holding text instead of
+handing back decoded noise. Everything else works the same: metadata, expiry,
+rotation, sharing, history.
+
+Bytes cannot be stored with `sealed: false`. They would sit in the database as
+base64 and read back as text, which is a trap rather than a feature.
 
 ## Storage
 

@@ -8,6 +8,27 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 1.7.0 — 2026-08-24
+
+Additive. Two things people were doing by hand.
+
+### Added
+
+- **`putBytes` / `openBytes`** for values that are not text — a certificate, a
+  keyfile, a kubeconfig. Base64 on the way in and out, done once here rather
+  than once per caller. The entry is marked as bytes in its metadata, so
+  `openBytes` refuses an entry holding text instead of decoding a password into
+  noise and returning it. `sealed: false` is refused for bytes: they would sit
+  in the database as base64 and read back as text, which is a trap.
+- **References inside strings.** `"postgres://app:@vault:db_password@host/db"`
+  now resolves, where before only a whole-string reference did. Several in one
+  string all resolve, and a reference inside a string can name a shared secret
+  as `@vault:alice/db`.
+
+  A string that is entirely one reference is still handed back as the value
+  itself rather than interpolated into a copy, so nothing that worked before
+  changed shape.
+
 ## 1.6.0 — 2026-08-24
 
 Additive. Scale: nothing here needs the whole vault in memory any more.
