@@ -8,8 +8,12 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
-## Unreleased
+## 0.5.5 — 2026-08-24
 
+The first release published by CI rather than from a laptop.
+
+- `CHANGELOG.md` ships with the package, so `node_modules` carries the history
+  as well as the reference.
 - Continuous integration: types, documentation, tests at 100%, build, and an
   import under Node on every push.
 - Releases are cut by pushing a tag rather than publishing from a laptop. The
@@ -17,6 +21,10 @@ the code; the published tarballs on npm are the real artifacts.
   the wrong commit would put a version on npm that cannot be taken back.
 - `LICENSE` file, so the MIT licence `package.json` always claimed is actually
   in the repository.
+- The release workflow does nothing for a tag whose version npm already has,
+  so a retroactive or re-pushed tag does not cry wolf.
+
+No library code changed.
 
 ## 0.5.4 — 2026-08-23
 
