@@ -64,6 +64,24 @@ export const BYTES_MARKER = "@vault:bytes"
  */
 const NAME_END = /[^A-Za-z0-9._/-]/
 
+/** What {@link Vault.unbound} found still needing migration. */
+export type UnboundReport = {
+    /**
+     * Entries whose data key opens, but is not tied to the entry — written
+     * before 1.4 and not rekeyed since.
+     */
+    untied: string[]
+    /**
+     * Entries that do not open under any key this vault holds, tied or not.
+     *
+     * @remarks
+     * A different problem, and one that was there before the upgrade: a key
+     * that was retired without a `rekey`, or a record altered underneath the
+     * vault. Listed separately so a migration is not mistaken for a loss.
+     */
+    unopenable: string[]
+}
+
 /** One page of a listing, and where to carry on from. */
 export type Page = {
     /** The entries on this page, by name. */
@@ -274,18 +292,18 @@ export type VaultOptions = {
      * read the entry.
      *
      * @remarks
-     * Off by default, because it turns a write that used to succeed into a 409
-     * and vaults written against 1.1 should keep behaving as they did. Turn it
-     * on wherever more than one process writes the same store: without it, two
-     * writers racing on one entry silently lose one of the two values, and the
-     * loser is told the write succeeded.
+     * On by default since 2.0. Two writers racing on one entry would otherwise
+     * silently lose one of the two values, and tell the loser it had succeeded
+     * — which is not a default anything should have had.
      *
-     * A single caller passing {@link PutOptions.expectedRevision} gets the same
+     * Turning it off restores 1.x behaviour: last write wins, quietly. There
+     * are single-writer programs where that is fine and one fewer error to
+     * handle.
+     *
+     * A caller passing {@link PutOptions.expectedRevision} gets the same
      * protection for that one call whatever this is set to.
      *
-     * How airtight it is depends on the store — see {@link VaultStore.putIf}.
-     *
-     * @defaultValue false
+     * @defaultValue true
      */
     strictWrites?: boolean
     /**
@@ -298,6 +316,23 @@ export type VaultOptions = {
      * @defaultValue {@link DEFAULT_PAGE_SIZE}
      */
     pageSize?: number
+    /**
+     * Open entries written before 1.4, whose data keys are not tied to their
+     * entry.
+     *
+     * @remarks
+     * Through 1.x the vault always fell back to this, which meant a vault could
+     * carry untied entries for years without anyone noticing. Since 2.0 it is
+     * off, and such an entry fails to open rather than quietly working.
+     *
+     * Turn it on to migrate: run `rekey` or `reseal`, which ties every entry
+     * down on the way past, then turn it off again. `unbound()` says whether
+     * anything is left.
+     *
+     * @defaultValue false
+     * @see {@link Vault.unbound}
+     */
+    allowUnbound?: boolean
     /**
      * Where to write an audit trail that outlives the process.
      *
@@ -502,6 +537,7 @@ export class Vault {
     private readonly audit: AuditLog | undefined
     private readonly auditRequired: boolean
     private readonly pageSize: number
+    private readonly allowUnbound: boolean
     /** The prefix {@link Vault.resolve} treats as a reference. */
     readonly prefix: string
 
@@ -519,9 +555,10 @@ export class Vault {
         historyLimit = DEFAULT_HISTORY_LIMIT,
         generators = {},
         onAccess,
-        strictWrites = false,
+        strictWrites = true,
         audit,
         pageSize = DEFAULT_PAGE_SIZE,
+        allowUnbound = false,
     }: VaultOptions) {
         this.current = toWrapper(key)
         this.retiredWrappers = previousKeys.map(toWrapper)
@@ -536,6 +573,7 @@ export class Vault {
         this.audit = settings.log
         this.auditRequired = settings.required ?? true
         this.pageSize = pageSize
+        this.allowUnbound = allowUnbound
     }
 
 
@@ -875,19 +913,8 @@ export class Vault {
         const against =
             expected === undefined ? (existing ? (existing.revision ?? 1) : null) : expected
 
-        if (this.store.putIf) {
-            const stored = await this.store.putIf(record, against)
-            if (stored) return stored
-        } else {
-            // No atomic path. Re-read as late as we can and compare: the window
-            // is smaller than doing nothing, and it is the best a store that
-            // cannot compare-and-set can offer.
-            const current = await this.store.get(record.owner, record.name)
-            const now = current ? (current.revision ?? 1) : null
-            if (now === against) {
-                return this.store.put(record)
-            }
-        }
+        const stored = await this.store.putIf(record, against)
+        if (stored) return stored
 
         await this.record({
             action: "denied",
@@ -1691,9 +1718,13 @@ export class Vault {
      * Unwraps a data key that may or may not be tied to its entry yet.
      *
      * @remarks
-     * Bound first, unbound only if that fails. A key sealed *with* a binding
-     * will not open without one, so the fallback can only ever reach a key
-     * written before 1.4 — it is a migration path, not a way around the tie.
+     * Bound first. A key sealed *with* a binding will not open without one, so
+     * falling back to unbound can only ever reach a key written before 1.4 — it
+     * is a migration path, not a way around the tie.
+     *
+     * Since 2.0 that fallback is off unless {@link VaultOptions.allowUnbound}
+     * asks for it, so a vault that believes it has migrated finds out rather
+     * than carrying untied entries indefinitely.
      *
      * @param sealedKey The wrapped data key.
      * @param binding What it should belong to.
@@ -1704,6 +1735,7 @@ export class Vault {
         try {
             return await this.unsealWithMaster(sealedKey, binding)
         } catch (error) {
+            if (!this.allowUnbound) throw error
             try {
                 return await this.unsealWithMaster(sealedKey, undefined)
             } catch {
@@ -2178,6 +2210,10 @@ export class Vault {
             metadata: entry.metadata,
             createdAt: new Date(entry.createdAt),
             updatedAt: new Date(entry.updatedAt),
+            // An import starts the entry's revision afresh: it is a new record
+            // in this vault, whatever it had been through in the last one.
+            revision: 1,
+            shares: [],
         })
         return true
     }
@@ -2239,6 +2275,57 @@ export class Vault {
             detail: `imported ${report.imported} entries`,
         })
         return report
+    }
+
+    /**
+     * Entries whose data keys are not yet tied to them — everything written
+     * before 1.4 and never rekeyed since.
+     *
+     * @remarks
+     * What to run before turning {@link VaultOptions.allowUnbound} off, and
+     * after a migration to confirm there is nothing left. An empty answer means
+     * every entry is tied down.
+     *
+     * It has to try opening each entry's data key to tell, so this is a walk of
+     * the whole vault and not a cheap one. It is a migration tool, not
+     * something to call on a request.
+     *
+     * @returns The entries still untied, by `owner/name`, and those that would
+     *   not open at all either way.
+     *
+     * @example
+     * ```ts
+     * const vault = new Vault({ key, store, allowUnbound: true })
+     * await vault.reseal()
+     *
+     * const { untied } = await vault.unbound()
+     * if (untied.length === 0) {
+     *     // safe to drop allowUnbound
+     * }
+     * ```
+     */
+    async unbound(): Promise<UnboundReport> {
+        const untied: string[] = []
+        const unopenable: string[] = []
+
+        for await (const record of this.scan()) {
+            if (!record.isSealed || !record.sealedKey) continue
+            const where = `${record.owner}/${record.name}`
+            const bound = Vault.binding(record.owner, record.name)
+
+            try {
+                await this.unsealWithMaster(record.sealedKey, bound)
+            } catch {
+                try {
+                    await this.unsealWithMaster(record.sealedKey, undefined)
+                    untied.push(where)
+                } catch {
+                    unopenable.push(where)
+                }
+            }
+        }
+
+        return { untied, unopenable }
     }
 
     /**

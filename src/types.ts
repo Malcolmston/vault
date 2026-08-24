@@ -221,15 +221,11 @@ export type SecretRecord = {
      * revision you saw back as {@link PutOptions.expectedRevision} to have the
      * write refused if anything changed in between.
      *
-     * Optional, and read as 1 when absent, so that a store written against an
-     * earlier version keeps compiling and keeps working. A record that predates
-     * 1.2.0 therefore reads back as revision 1 whatever it has actually been
-     * through — which only misleads a caller who read one before the upgrade
-     * and wrote after it.
-     *
-     * @defaultValue 1
+     * Required since 2.0. A store written against 1.x may still hand back a
+     * record without one; the vault reads that as 1, which is what it always
+     * did, but the type now says what a store is expected to keep.
      */
-    revision?: number
+    revision: number
     /**
      * Who else may read this entry, besides the owner.
      *
@@ -242,12 +238,11 @@ export type SecretRecord = {
      * a secret, and a listing that had to open every entry to answer "who has
      * access" would be worse for everyone.
      *
-     * Optional, and read as none when absent, so a store written against an
-     * earlier version keeps working.
-     *
-     * @defaultValue none
+     * Required since 2.0, as an array that may be empty. A store written
+     * against 1.x may still hand back a record without one, which reads as no
+     * grants.
      */
-    shares?: Share[]
+    shares: Share[]
 }
 
 /**
@@ -471,13 +466,17 @@ export type VaultStore = {
     remove(owner: string, name: string): Promise<boolean>
     /**
      * Writes a record only if the stored one is still at `expectedRevision`,
-     * in a single atomic step. Optional.
+     * in a single atomic step.
      *
      * @remarks
-     * Implement this if the underlying database can compare and set in one
+     * Required since 2.0. Through 1.x this was optional, and a store without it
+     * got a read-then-write that left a window where two writers could both
+     * believe they had won. Since {@link VaultOptions.strictWrites} is now on
+     * by default, that window would be a promise the vault could not keep, so
+     * the guarantee is required rather than hoped for.
+     *
+     * Implement it with whatever the database compares and sets in one
      * statement — a `WHERE revision = ?` on an `UPDATE`, or the equivalent.
-     * Without it the vault falls back to reading and then writing, which leaves
-     * a window between the two.
      *
      * The vault handles the revision bookkeeping: `record.revision` arrives
      * already incremented, and nothing here needs to work out what it should
@@ -490,7 +489,7 @@ export type VaultStore = {
      *   match — which the vault turns into a 409. Returning null is not an
      *   error and must not throw.
      */
-    putIf?(
+    putIf(
         record: SecretRecord,
         expectedRevision: number | null
     ): Promise<SecretRecord | null>

@@ -8,6 +8,51 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 2.0.0 — 2026-08-24
+
+The compatibility shims come off, and two defaults change to what they should
+always have been. [MIGRATING.md](MIGRATING.md) has the upgrade in full; nothing
+here is a rename, and every method keeps its name, arguments and meaning.
+
+### Breaking
+
+- **Entries written before 1.4 no longer open.** 1.4 tied each data key to its
+  entry's owner and name; entries older than that have no tie, and through 1.x
+  the vault quietly fell back to opening them anyway. That meant a vault could
+  carry untied entries indefinitely with nobody the wiser. Now it fails
+  instead.
+
+  Run `reseal()` on 1.7 before upgrading, or start 2.0 with
+  `allowUnbound: true` and run it there. The new `unbound()` reports what is
+  still untied, and separately what does not open under any key at all.
+
+- **`strictWrites` defaults to true.** A write that would land on top of a
+  change made since the vault last read the entry throws 409 rather than
+  silently winning. Losing a write and telling the loser it succeeded was never
+  a good default. `strictWrites: false` restores it for single-writer programs.
+
+- **`VaultStore.putIf` is required.** It was optional, and a store without it
+  got a read-then-write with a window where two writers could both believe they
+  had won. With `strictWrites` on by default that window would be a promise the
+  vault could not keep. The four stores that ship already implement it;
+  `page` stays optional, because its absence costs memory rather than a
+  guarantee.
+
+- **`SecretRecord.revision` and `.shares` are required.** They were optional so
+  that stores written against older versions kept compiling. At runtime the
+  vault still reads a missing `revision` as 1 and missing `shares` as none, so
+  a 1.x store will not break mid-upgrade.
+
+### Added
+
+- `unbound()`, to find entries that still need tying down, and `allowUnbound`
+  to open them while you do.
+
+### Removed
+
+- The read-then-write fallback for stores without `putIf`, and every caveat in
+  the documentation that existed to describe it.
+
 ## 1.7.0 — 2026-08-24
 
 Additive. Two things people were doing by hand.

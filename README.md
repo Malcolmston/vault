@@ -679,18 +679,34 @@ publishes with the `NPM_TOKEN` repository secret.
 `workflow_dispatch` runs everything except the publish, for checking the
 pipeline without spending a version number.
 
+## Upgrading from 1.x
+
+[MIGRATING.md](MIGRATING.md) has the detail. In short:
+
+- **Entries written before 1.4 no longer open by default.** Run `reseal()` on
+  1.7 first, or start 2.0 with `allowUnbound: true` and run it there. `unbound()`
+  tells you what is left.
+- **`strictWrites` is on by default**, so a write that would clobber a
+  concurrent change throws 409. `strictWrites: false` restores the old
+  behaviour.
+- **A custom store must implement `putIf`**, and `SecretRecord.revision` and
+  `.shares` are required. The four stores that ship already comply.
+
+Nothing else moved.
+
 ## Stability
 
-1.0 means the surface below is settled, and a breaking change to it needs a
-2.0:
+2.0 means the surface below is settled, and a breaking change to it needs a
+3.0:
 
 - The `Vault` class and its methods.
 - `VaultStore`, so a store written today keeps working.
-- `KeyProvider`, and the three providers that ship.
+- `KeyProvider` and `KeyWrapper`, and the providers that ship.
 - `SecretRecord`, `SecretSummary`, `PutOptions`, `RotationPolicy`,
-  `VaultEvent`, and the errors.
-- The sealed format, `iv:payload` under a data key. A version that could not
-  open what an earlier one wrote would be a 2.0.
+  `VaultEvent`, `Share`, `AuditLog`, and the errors.
+- The sealed format: a data key per value, wrapped under the master key and
+  tied to the entry's owner and name. A version that could not open what an
+  earlier one wrote would be a 3.0.
 
 Adding an optional field to an options object, a new store, or a new provider
 is a minor version. Anything that changes what an existing call does is a

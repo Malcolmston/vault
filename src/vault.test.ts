@@ -177,6 +177,8 @@ test("a value sealed under the master directly still opens", async () => {
         metadata: {},
         createdAt: new Date(),
         updatedAt: new Date(),
+        revision: 1,
+        shares: [],
     })
 
     expect(await vault.open("alice", "legacy")).toBe("from before")
@@ -378,6 +380,8 @@ test("rekey gives an envelope to a value that never had one", async () => {
         metadata: {},
         createdAt: new Date(),
         updatedAt: new Date(),
+        revision: 1,
+        shares: [],
     })
 
     const next = generateKey()
@@ -413,6 +417,8 @@ test("a value that will not open is named, not destroyed", async () => {
         metadata: {},
         createdAt: new Date(),
         updatedAt: new Date(),
+        revision: 1,
+        shares: [],
     })
     const before = (await store.get("alice", "stranger"))!.sealedKey
 
@@ -797,6 +803,8 @@ test("a rekey works through the file store", async () => {
 
 test("a record written straight to a store keeps its shape", async () => {
     const record: SecretRecord = {
+        revision: 1,
+        shares: [],
         owner: "alice",
         name: "direct",
         sealed: "iv:payload",
@@ -1067,6 +1075,8 @@ test("reseal reports what it could not open instead of stopping there", async ()
         metadata: {},
         createdAt: new Date(),
         updatedAt: new Date(),
+        revision: 1,
+        shares: [],
     })
     await vault.put("alice", "also_good", "readable too")
 
@@ -1252,6 +1262,8 @@ test("an export refuses rather than silently dropping what it cannot open", asyn
         metadata: {},
         createdAt: new Date(),
         updatedAt: new Date(),
+        revision: 1,
+        shares: [],
     })
 
     await expect(vault.exportAll(generateKey())).rejects.toThrow(VaultKeyError)
@@ -1355,29 +1367,11 @@ test("without strictWrites, a plain put still overwrites as it always did", asyn
     expect(await vault.open("alice", "token")).toBe("two")
 })
 
-test("a store with no putIf still gets checked, just less tightly", async () => {
-    // MemoryStore has putIf; this one deliberately does not, which is the
-    // fallback path a hand-rolled store lands on.
-    const plain: VaultStore = {
-        get: (owner, name) => store.get(owner, name),
-        list: (owner) => store.list(owner),
-        all: () => store.all(),
-        put: (record) => store.put(record),
-        remove: (owner, name) => store.remove(owner, name),
-    }
-    const fallback = new Vault({ key: KEY, store: plain })
-
-    await fallback.put("alice", "token", "one")
-    await fallback.put("alice", "token", "two", { expectedRevision: 1 })
-    expect(await fallback.open("alice", "token")).toBe("two")
-
-    await expect(
-        fallback.put("alice", "token", "three", { expectedRevision: 1 })
-    ).rejects.toThrow(/has changed/)
-})
-
 test("a record from before revisions counts on from 1", async () => {
-    const before: SecretRecord = {
+    // A store written against 1.x can still hand back a record with no
+    // revision at runtime, whatever the type now says, so the vault still has
+    // to read one as 1. The cast is the point of the test.
+    const before = {
         owner: "alice",
         name: "old",
         sealed: await seal(await importKey(KEY), "value"),
@@ -1392,8 +1386,9 @@ test("a record from before revisions counts on from 1", async () => {
         metadata: {},
         createdAt: new Date(),
         updatedAt: new Date(),
+        shares: [],
         // no revision at all, as an older store would have written it
-    }
+    } as unknown as SecretRecord
     await store.put(before)
 
     expect((await vault.list("alice"))[0]?.revision).toBeUndefined()
@@ -1444,6 +1439,7 @@ test("FileStore settles a contested write under its lock", async () => {
 /** A minimal record, for testing a store directly. */
 function record(owner: string, name: string, revision: number): SecretRecord {
     return {
+        shares: [],
         owner,
         name,
         sealed: "iv:payload",
@@ -2077,6 +2073,8 @@ async function unbound(name: string, value: string): Promise<SecretRecord> {
         metadata: {},
         createdAt: new Date(),
         updatedAt: new Date(),
+        revision: 1,
+        shares: [],
     }
 }
 
@@ -2115,12 +2113,26 @@ test("history cannot be moved between entries either", async () => {
     await expect(vault.versions("bob", "db")).rejects.toThrow(VaultKeyError)
 })
 
-test("an entry written before 1.4 still opens, and a rekey ties it down", async () => {
+test("an entry written before 1.4 is refused unless asked for", async () => {
     await store.put(await unbound("legacy", "from before"))
-    expect(await vault.open("alice", "legacy")).toBe("from before")
+
+    // 2.0 does not quietly open an untied entry.
+    await expect(vault.open("alice", "legacy")).rejects.toThrow(VaultKeyError)
+
+    const migrating = new Vault({ key: KEY, store, allowUnbound: true })
+    expect(await migrating.open("alice", "legacy")).toBe("from before")
+})
+
+test("a rekey ties down an entry written before 1.4", async () => {
+    await store.put(await unbound("legacy", "from before"))
 
     const next = generateKey()
-    const moved = new Vault({ key: next, store, previousKeys: [KEY] })
+    const moved = new Vault({
+        key: next,
+        store,
+        previousKeys: [KEY],
+        allowUnbound: true,
+    })
     expect((await moved.rekey(next)).rekeyed).toBe(1)
 
     // Tied down on the way past: the key no longer opens unbound.
@@ -2134,12 +2146,38 @@ test("an entry written before 1.4 still opens, and a rekey ties it down", async 
 
 test("a reseal ties down an entry written before 1.4 as well", async () => {
     await store.put(await unbound("legacy", "from before"))
+    const migrating = new Vault({ key: KEY, store, allowUnbound: true })
 
-    expect((await vault.reseal("alice")).rekeyed).toBe(1)
+    expect((await migrating.reseal("alice")).rekeyed).toBe(1)
 
     const after = (await store.get("alice", "legacy"))!
     await expect(open(await importKey(KEY), after.sealedKey!)).rejects.toThrow(VaultKeyError)
+    // Tied down now, so the strict vault opens it too.
     expect(await vault.open("alice", "legacy")).toBe("from before")
+})
+
+test("unbound() says what still needs migrating, and when nothing does", async () => {
+    await store.put(await unbound("legacy", "from before"))
+    await vault.put("alice", "modern", "tied down")
+
+    const migrating = new Vault({ key: KEY, store, allowUnbound: true })
+    expect(await migrating.unbound()).toEqual({
+        untied: ["alice/legacy"],
+        unopenable: [],
+    })
+
+    await migrating.reseal()
+    expect(await migrating.unbound()).toEqual({ untied: [], unopenable: [] })
+})
+
+test("unbound() reports an entry no key opens at all, separately", async () => {
+    const stranger = new Vault({ key: generateKey(), store })
+    await vault.put("alice", "mine", "x")
+
+    expect(await stranger.unbound()).toEqual({
+        untied: [],
+        unopenable: ["alice/mine"],
+    })
 })
 
 test("an export still moves between vaults, bindings and all", async () => {
@@ -2413,6 +2451,7 @@ test("a walk of the whole store reads it a page at a time", async () => {
             throw new Error("all() should not be reached when page() exists")
         },
         put: (record) => store.put(record),
+        putIf: (record, expected) => store.putIf(record, expected),
         remove: (owner, name) => store.remove(owner, name),
         page: (after, limit) => {
             pages.push(after)
@@ -2436,6 +2475,7 @@ test("a store with no page() is still walked, just all at once", async () => {
         list: (owner) => store.list(owner),
         all: () => store.all(),
         put: (record) => store.put(record),
+        putIf: (record, expected) => store.putIf(record, expected),
         remove: (owner, name) => store.remove(owner, name),
     }
     const walking = new Vault({ key: KEY, store: plain })
@@ -2746,4 +2786,26 @@ test("a custom prefix works inside a string too, regex characters and all", asyn
     expect(await odd.resolve("alice", { V: "before $(token after" })).toEqual({
         V: "before secret after",
     })
+})
+
+
+// --- what 2.0 changed -----------------------------------------------------
+
+test("a racing write is refused by default now, without being asked", async () => {
+    // No strictWrites in the options: this is the default.
+    await vault.put("alice", "token", "one")
+
+    const results = await Promise.allSettled([
+        vault.put("alice", "token", "A", { expectedRevision: 1 }),
+        vault.put("alice", "token", "B", { expectedRevision: 1 }),
+    ])
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1)
+})
+
+test("last-write-wins is still available for a single writer", async () => {
+    const relaxed = new Vault({ key: KEY, store, strictWrites: false })
+    await relaxed.put("alice", "token", "one")
+    await relaxed.put("alice", "token", "two")
+
+    expect(await relaxed.open("alice", "token")).toBe("two")
 })
