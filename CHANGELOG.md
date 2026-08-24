@@ -8,6 +8,36 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 2.2.0 — 2026-08-24
+
+Additive.
+
+### Added
+
+- **`putSshKey` / `openSshKey` / `sshPublicKey` / `rotateSshKey`.** The vault
+  makes an Ed25519 SSH key, seals the private half and keeps the public half
+  and fingerprint in the metadata — so a listing can say which key is on which
+  host without opening anything.
+
+  Ed25519 with no choice offered: no key size to get wrong, and every OpenSSH
+  since 6.5 takes them.
+
+  `rotateSshKey` keeps the previous key openable through `versions()`, so a
+  host that has not had the new public key installed yet is not locked out the
+  moment it runs.
+
+- **`generateSshKey`, `sshPublicLine`, `sshFingerprint`** on their own, since
+  none of them needs a vault.
+
+The OpenSSH private key format is written by hand — it is small and specified,
+and a dependency to produce ninety bytes of framing would be a poor trade for a
+package that has none. The tests check it the only way worth checking: they
+write the key out and have the real `ssh-keygen` derive the public key from it
+and print its fingerprint, then compare both against ours.
+
+Keys are stored unencrypted inside their envelope. A key file on disk needs a
+passphrase; one in a vault already has the master key in front of it.
+
 ## 2.1.0 — 2026-08-24
 
 Additive.

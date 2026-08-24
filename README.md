@@ -154,6 +154,37 @@ The URL contains the secret. Data URLs have a way of ending up in logs, DOM
 dumps and browser history — treat what comes back the way you would treat
 `open()`.
 
+## SSH keys
+
+The vault can make them, keep the private half, and publish the public one:
+
+```ts
+await vault.putSshKey("alice", "deploy", { comment: "deploy@ci" })
+
+const { publicKey, fingerprint } = await vault.sshPublicKey("alice", "deploy")
+// "ssh-ed25519 AAAAC3… deploy@ci", "SHA256:…"
+```
+
+Ed25519, with no choice offered: no key size to get wrong, and every OpenSSH
+since 6.5 takes them. The public key and fingerprint live in the metadata, in
+the clear, so a listing can say which key is on which host without opening
+anything — and `sshPublicKey` costs one read and no unsealing.
+
+The private key comes out in OpenSSH's own format, ready to use:
+
+```ts
+await Bun.write("id_ed25519", await vault.openSshKey("alice", "deploy"))
+// then chmod 0600, or ssh will refuse it
+```
+
+It is stored unencrypted inside its envelope. A key file on disk needs a
+passphrase; one in a vault already has the master key in front of it, and a
+second passphrase would just be another secret to keep.
+
+`rotateSshKey` replaces a key and keeps the old one openable through
+`versions()`, so a host that has not had the new public key installed yet is not
+locked out the moment it runs.
+
 ## Storage
 
 Four stores ship with the package. If more than one process writes the same

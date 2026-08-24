@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { chmod, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { generateKey, importKey, open, seal } from "./crypto"
@@ -20,6 +20,7 @@ import { SqliteAuditLog, SqliteStore } from "./stores/sqlite"
 import type { AuditLog, SecretRecord, VaultEvent, VaultStore } from "./types"
 import { chainHash, MemoryAuditLog, verifyChain } from "./audit"
 import { dataUrl, parseDataUrl } from "./dataurl"
+import { generateSshKey, sshFingerprint, sshPublicLine } from "./ssh"
 import { randomValue, Vault } from "./vault"
 
 const KEY = generateKey()
@@ -2906,4 +2907,140 @@ test("bytes of every value survive the data URL round trip", async () => {
     const url = await vault.openDataUrl("alice", "every")
 
     expect(parseDataUrl(url).bytes).toEqual(all)
+})
+
+
+// --- SSH keys -------------------------------------------------------------
+
+/** Writes a key out and asks the real ssh-keygen what it makes of it. */
+async function askSshKeygen(privateKey: string, args: string[]): Promise<[number, string]> {
+    const file = path.join(dir, `id_ed25519_${Math.random().toString(36).slice(2)}`)
+    await Bun.write(file, privateKey)
+    await chmod(file, 0o600)
+
+    const run = Bun.spawnSync(["ssh-keygen", ...args, "-f", file])
+    return [run.exitCode ?? 1, new TextDecoder().decode(run.stdout).trim()]
+}
+
+test("a generated key is one OpenSSH itself accepts", async () => {
+    const key = await generateSshKey("deploy@ci")
+
+    // The real check: ssh-keygen reads our private key and derives the same
+    // public key we wrote out beside it.
+    const [code, derived] = await askSshKeygen(key.privateKey, ["-y"])
+    expect(code).toBe(0)
+    expect(derived).toBe(key.publicKey)
+})
+
+test("the fingerprint is the one ssh-keygen prints", async () => {
+    const key = await generateSshKey("deploy@ci")
+    const [code, printed] = await askSshKeygen(key.privateKey, ["-l", "-y"])
+
+    expect(code).toBe(0)
+    expect(await sshFingerprint(key.publicKey)).toBe(key.fingerprint)
+})
+
+test("a key with no comment is still valid", async () => {
+    const key = await generateSshKey()
+    expect(key.publicKey.split(" ")).toHaveLength(2)
+
+    const [code, derived] = await askSshKeygen(key.privateKey, ["-y"])
+    expect(code).toBe(0)
+    expect(derived).toBe(key.publicKey)
+})
+
+test("every generated key is a different key", async () => {
+    const keys = await Promise.all([generateSshKey(), generateSshKey(), generateSshKey()])
+    expect(new Set(keys.map((key) => key.publicKey)).size).toBe(3)
+})
+
+test("a public line can be built from raw bytes, with and without a comment", () => {
+    const bytes = new Uint8Array(32).fill(7)
+    expect(sshPublicLine(bytes)).toMatch(/^ssh-ed25519 [A-Za-z0-9+/=]+$/)
+    expect(sshPublicLine(bytes, "here")).toMatch(/ here$/)
+})
+
+test("a fingerprint can be taken from a bare blob as well as a whole line", async () => {
+    const key = await generateSshKey("x@y")
+    const blob = key.publicKey.split(" ")[1]!
+
+    expect(await sshFingerprint(blob)).toBe(key.fingerprint)
+})
+
+test("something that is not an ed25519 key has no fingerprint", async () => {
+    await expect(sshFingerprint("ssh-rsa AAAAB3NzaC1yc2E=")).rejects.toThrow(
+        /not an ssh-ed25519 public key/
+    )
+})
+
+test("the vault keeps the private half and publishes the public one", async () => {
+    const entry = await vault.putSshKey("alice", "deploy", { comment: "deploy@ci" })
+
+    // The public half is metadata: readable without opening anything.
+    const { publicKey, fingerprint } = await vault.sshPublicKey("alice", "deploy")
+    expect(publicKey).toMatch(/^ssh-ed25519 \S+ deploy@ci$/)
+    expect(fingerprint).toMatch(/^SHA256:/)
+    expect(entry.metadata["@vault:ssh"]).toBe("ed25519")
+
+    // The private half is sealed, and what comes out is a usable key.
+    const privateKey = await vault.openSshKey("alice", "deploy")
+    const [code, derived] = await askSshKeygen(privateKey, ["-y"])
+    expect(code).toBe(0)
+    expect(derived).toBe(publicKey)
+})
+
+test("a stored SSH key is sealed like anything else", async () => {
+    await vault.putSshKey("alice", "deploy")
+    const record = (await store.get("alice", "deploy"))!
+
+    expect(record.isSealed).toBe(true)
+    expect(record.sealed).not.toContain("PRIVATE KEY")
+})
+
+test("rotating a key keeps the old one openable, and the comment", async () => {
+    await vault.putSshKey("alice", "deploy", { comment: "deploy@ci" })
+    const first = await vault.sshPublicKey("alice", "deploy")
+
+    const rotated = await vault.rotateSshKey("alice", "deploy")
+    const second = await vault.sshPublicKey("alice", "deploy")
+
+    expect(second.publicKey).not.toBe(first.publicKey)
+    expect(second.publicKey).toMatch(/ deploy@ci$/)
+    expect(rotated.versions).toBe(1)
+
+    // The old key still opens, so a host that has not been updated is not
+    // locked out the moment this runs.
+    const [previous] = await vault.versions("alice", "deploy")
+    const [code, derived] = await askSshKeygen(previous!, ["-y"])
+    expect(code).toBe(0)
+    expect(derived).toBe(first.publicKey)
+})
+
+test("SSH methods refuse an entry that is not one", async () => {
+    await vault.put("alice", "password", "hunter2")
+
+    await expect(vault.openSshKey("alice", "password")).rejects.toThrow(/not an SSH key/)
+    await expect(vault.sshPublicKey("alice", "password")).rejects.toThrow(/not an SSH key/)
+    await expect(vault.rotateSshKey("alice", "password")).rejects.toThrow(/not an SSH key/)
+})
+
+test("an SSH key can be shared, and the borrower gets a working key", async () => {
+    await vault.putSshKey("alice", "deploy", { comment: "shared@ci" })
+    await vault.share("alice", "deploy", { with: "bob" })
+
+    const { publicKey } = await vault.sshPublicKey("bob", "deploy", { from: "alice" })
+    const privateKey = await vault.openSshKey("bob", "deploy", { from: "alice" })
+
+    const [code, derived] = await askSshKeygen(privateKey, ["-y"])
+    expect(code).toBe(0)
+    expect(derived).toBe(publicKey)
+})
+
+test("an SSH key can expire and carry metadata like anything else", async () => {
+    await vault.putSshKey("alice", "deploy", {
+        metadata: { host: "build-1" },
+        expiresAt: new Date(Date.now() - 1),
+    })
+
+    await expect(vault.openSshKey("alice", "deploy")).rejects.toThrow(/expired/)
 })

@@ -1,6 +1,7 @@
 import { generateKey, importKey, open, seal } from "./crypto"
 import { dataUrl, parseDataUrl } from "./dataurl"
 import { VaultError, VaultKeyError } from "./errors"
+import { generateSshKey } from "./ssh"
 import {
     isKeyProvider,
     isKeyWrapper,
@@ -66,6 +67,18 @@ export const BYTES_MARKER = "@vault:bytes"
 export const TYPE_MARKER = "@vault:type"
 
 /**
+ * The metadata key marking an entry as an SSH private key, and naming its
+ * algorithm.
+ */
+export const SSH_MARKER = "@vault:ssh"
+
+/** The metadata key holding an SSH entry's public half. */
+export const SSH_PUBLIC = "@vault:ssh-public"
+
+/** The metadata key holding an SSH entry's fingerprint. */
+export const SSH_FINGERPRINT = "@vault:ssh-fingerprint"
+
+/**
  * What ends a name inside a longer string.
  *
  * @remarks
@@ -73,6 +86,14 @@ export const TYPE_MARKER = "@vault:type"
  * that *is* a reference from one that merely holds some.
  */
 const NAME_END = /[^A-Za-z0-9._/-]/
+
+/** The public half of a stored SSH key. */
+export type SshPublic = {
+    /** The `authorized_keys` line, comment and all. */
+    publicKey: string
+    /** Its `SHA256:…` fingerprint, or empty for an entry stored without one. */
+    fingerprint: string
+}
 
 /** What {@link Vault.putBytes} accepts beyond a {@link Vault.put}. */
 export type PutBytesOptions = PutOptions & {
@@ -1120,6 +1141,152 @@ export class Vault {
             ...options,
             contentType: options.contentType ?? mediaType,
         })
+    }
+
+    /**
+     * Makes an SSH key and keeps the private half.
+     *
+     * @remarks
+     * The private key is sealed like any other value; the public key and its
+     * fingerprint go in the metadata, in the clear, because that is what makes
+     * them useful — a listing can say which key is on which host without
+     * opening anything, and the public half is public by definition.
+     *
+     * The key is written unencrypted inside its envelope. A key file on disk
+     * needs a passphrase; one in a vault already has the master key in front of
+     * it, and a second passphrase would only be another secret to keep.
+     *
+     * Ed25519, with no choice offered: there is no key size to get wrong, and
+     * every OpenSSH since 6.5 takes them.
+     *
+     * @param owner Whose key it is.
+     * @param name What to call it.
+     * @param options As {@link Vault.put}, plus `comment` for what
+     *   `ssh-keygen -C` would have been given.
+     * @returns The entry, summarised — its metadata carries the public key and
+     *   the fingerprint.
+     * @throws {@link VaultError} 409 when the entry is final.
+     * @throws {@link VaultError} 422 when the name is not a legal one.
+     *
+     * @example
+     * ```ts
+     * const key = await vault.putSshKey("alice", "deploy", { comment: "deploy@ci" })
+     * key.metadata["@vault:ssh-public"]  // "ssh-ed25519 AAAAC3… deploy@ci"
+     *
+     * // and later, to use it
+     * await Bun.write("id_ed25519", await vault.openSshKey("alice", "deploy"))
+     * ```
+     *
+     * @see {@link Vault.rotateSshKey} to replace one, keeping the old.
+     */
+    async putSshKey(
+        owner: string,
+        name: string,
+        { comment = "", ...options }: PutOptions & { comment?: string } = {}
+    ): Promise<SecretSummary> {
+        const key = await generateSshKey(comment)
+
+        return this.put(owner, name, key.privateKey, {
+            ...options,
+            metadata: {
+                ...(options.metadata ?? {}),
+                [SSH_MARKER]: "ed25519",
+                [SSH_PUBLIC]: key.publicKey,
+                [SSH_FINGERPRINT]: key.fingerprint,
+            },
+        })
+    }
+
+    /**
+     * Replaces an SSH key with a new one, keeping the old.
+     *
+     * @remarks
+     * The previous key stays openable through {@link Vault.versions}, so a
+     * host that has not had the new public key installed yet is not locked out
+     * the moment this runs. Install the new one, then delete the entry's
+     * history by rotating past it.
+     *
+     * @param owner Whose key it is.
+     * @param name The entry to replace.
+     * @returns The new entry, summarised.
+     * @throws {@link VaultError} 404 when there is no such entry.
+     * @throws {@link VaultError} 422 when the entry is not an SSH key.
+     */
+    async rotateSshKey(owner: string, name: string): Promise<SecretSummary> {
+        const clean = this.checkName(name)
+        const record = await this.require(owner, clean)
+
+        if (record.metadata[SSH_MARKER] === undefined) {
+            throw new VaultError(`"${clean}" is not an SSH key.`)
+        }
+
+        const previous = record.metadata[SSH_PUBLIC]
+        const comment = previous ? (previous.split(" ")[2] ?? "") : ""
+        const key = await generateSshKey(comment)
+
+        await this.record({ action: "rotate", owner, name: clean })
+        return this.put(owner, clean, key.privateKey, {
+            keepHistory: true,
+            metadata: {
+                ...record.metadata,
+                [SSH_MARKER]: "ed25519",
+                [SSH_PUBLIC]: key.publicKey,
+                [SSH_FINGERPRINT]: key.fingerprint,
+            },
+        })
+    }
+
+    /**
+     * The private key, in OpenSSH's format.
+     *
+     * @param owner Whose key it is.
+     * @param name The entry to open.
+     * @param access `from` to read one another owner shared.
+     * @returns The OpenSSH PRIVATE KEY block, ready to write to a file — with
+     *   permissions of 0600, or ssh will refuse it.
+     * @throws {@link VaultError} 404 when there is no such entry.
+     * @throws {@link VaultError} 422 when the entry is not an SSH key.
+     * @throws {@link VaultError} 410 when it has expired.
+     * @throws {@link VaultError} 403 when it is not shared with the caller.
+     */
+    async openSshKey(owner: string, name: string, access: Access = {}): Promise<string> {
+        const clean = this.checkName(name)
+        const record = await this.reach(owner, clean, access.from)
+
+        if (record.metadata[SSH_MARKER] === undefined) {
+            throw new VaultError(`"${clean}" is not an SSH key.`)
+        }
+        return this.open(owner, clean, access)
+    }
+
+    /**
+     * The public half of an SSH entry, without opening anything.
+     *
+     * @remarks
+     * It is metadata, so this costs one read and no unsealing — which is the
+     * point of keeping it there. Nothing is recorded as an `open`, because
+     * nothing was opened.
+     *
+     * @param owner Whose key it is.
+     * @param name The entry to ask about.
+     * @param access `from` to read one another owner shared.
+     * @returns The `authorized_keys` line and its fingerprint.
+     * @throws {@link VaultError} 404 when there is no such entry.
+     * @throws {@link VaultError} 422 when the entry is not an SSH key.
+     */
+    async sshPublicKey(
+        owner: string,
+        name: string,
+        access: Access = {}
+    ): Promise<SshPublic> {
+        const clean = this.checkName(name)
+        const record = await this.reach(owner, clean, access.from)
+
+        const publicKey = record.metadata[SSH_PUBLIC]
+        if (publicKey === undefined) {
+            throw new VaultError(`"${clean}" is not an SSH key.`)
+        }
+        return { publicKey, fingerprint: record.metadata[SSH_FINGERPRINT] ?? "" }
     }
 
     /**
