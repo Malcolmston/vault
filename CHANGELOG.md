@@ -8,6 +8,39 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 1.0.0 — 2026-08-24
+
+The surface is settled. What it covers and what a change to it costs is in the
+README's Stability section; the short version is that a breaking change now
+needs a 2.0.
+
+### Breaking
+
+- `PutOptions.open` is now `PutOptions.sealed`, and means the opposite:
+  `{ sealed: false }` where you wrote `{ open: true }`. It was too easy to read
+  the old name as a relative of `Vault.open`, which is a different idea.
+- `reseal` returns a report — `{ rekeyed, failed }` — instead of a count, and
+  no longer stops at the first value it cannot open. One unopenable entry used
+  to abort the run and leave the rest unsealed; now it is named in `failed` and
+  the others are done. Same contract as `rekey`.
+
+### Fixed
+
+- A store no longer hands out the records it is keeping. Mutating something
+  returned by `get`, `list` or `all` used to rewrite the store from underneath
+  it; every store now returns copies.
+- `put` inherits `final` from the entry it replaces, like every other option.
+- The timestamp `rotate` returns is the one it wrote, rather than a second
+  `new Date()` a few microseconds later.
+
+### Added
+
+- A CommonJS build, so `require("@mstone6969/vault")` works as well as
+  `import`. The build refuses to finish if the CommonJS copy will not load
+  under `require`.
+- `SECURITY.md`: what the vault protects against, what it does not, and how to
+  choose and retire a key.
+
 ## 0.5.5 — 2026-08-24
 
 The first release published by CI rather than from a laptop.

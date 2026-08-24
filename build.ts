@@ -28,6 +28,24 @@ if (!built.success) {
     process.exit(1)
 }
 
+// A CommonJS copy, so `require("@mstone6969/vault")` works too. Node decides
+// which one it is loading by extension, hence .cjs rather than a second
+// package.json.
+const commonjs = await Bun.build({
+    entrypoints: ["src/index.ts"],
+    outdir: "dist",
+    target: "node",
+    format: "cjs",
+    naming: "[dir]/[name].cjs",
+    sourcemap: "linked",
+    external: ["bun:sqlite"],
+})
+
+if (!commonjs.success) {
+    for (const log of commonjs.logs) console.error(log)
+    process.exit(1)
+}
+
 const sqlite = await Bun.build({
     entrypoints: ["src/stores/sqlite.ts"],
     outdir: "dist/stores",
@@ -46,6 +64,14 @@ if (!sqlite.success) {
 await mkdir("dist/stores", { recursive: true })
 await Bun.write("dist/stores/memory.js", 'export { MemoryStore } from "../index.js";\n')
 await Bun.write("dist/stores/file.js", 'export { FileStore } from "../index.js";\n')
+await Bun.write(
+    "dist/stores/memory.cjs",
+    'module.exports = { MemoryStore: require("../index.cjs").MemoryStore };\n'
+)
+await Bun.write(
+    "dist/stores/file.cjs",
+    'module.exports = { FileStore: require("../index.cjs").FileStore };\n'
+)
 
 const types = Bun.spawnSync(["bunx", "tsc", "-p", "tsconfig.build.json"], {
     stdout: "inherit",
@@ -87,12 +113,26 @@ if ((await smoke.open("build", "check")) !== "value") {
     process.exit(1)
 }
 
-// The root bundle must stay importable from Node, which cannot resolve bun:*.
-if ((await Bun.file("dist/index.js").text()).includes("bun:sqlite")) {
-    console.error("dist/index.js pulls in bun:sqlite; Node could not import it.")
+// Neither root bundle may pull in bun:*, which Node cannot resolve.
+for (const entry of ["dist/index.js", "dist/index.cjs"]) {
+    if ((await Bun.file(entry).text()).includes("bun:sqlite")) {
+        console.error(`${entry} pulls in bun:sqlite; Node could not load it.`)
+        process.exit(1)
+    }
+}
+
+// And the CommonJS copy has to actually load under require().
+const required = Bun.spawnSync([
+    "node",
+    "-e",
+    'const v = require("./dist/index.cjs"); if (!v.Vault) throw new Error("no Vault export")',
+])
+if (required.exitCode !== 0) {
+    console.error("dist/index.cjs does not load under require():")
+    console.error(new TextDecoder().decode(required.stderr))
     process.exit(1)
 }
 
-for (const output of [...built.outputs, ...sqlite.outputs]) {
+for (const output of [...built.outputs, ...commonjs.outputs, ...sqlite.outputs]) {
     console.log(`  ${output.path.split("/dist/")[1]}  ${(output.size / 1024).toFixed(1)} KB`)
 }

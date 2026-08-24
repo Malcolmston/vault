@@ -92,6 +92,11 @@ export class FileStore implements VaultStore {
         return this.keyCache
     }
 
+    /** A record of its own, so callers and the store cannot alter each other's. */
+    private static copy(record: SecretRecord): SecretRecord {
+        return structuredClone(record)
+    }
+
     private static id(owner: string, name: string): string {
         return `${owner} ${name}`
     }
@@ -190,7 +195,8 @@ export class FileStore implements VaultStore {
      *   or the key does not open it.
      */
     async get(owner: string, name: string): Promise<SecretRecord | null> {
-        return (await this.load()).get(FileStore.id(owner, name)) ?? null
+        const record = (await this.load()).get(FileStore.id(owner, name))
+        return record ? FileStore.copy(record) : null
     }
 
     /**
@@ -204,7 +210,9 @@ export class FileStore implements VaultStore {
      * @throws {@link VaultKeyError} on the first call if the file cannot be opened.
      */
     async list(owner: string): Promise<SecretRecord[]> {
-        return [...(await this.load()).values()].filter((record) => record.owner === owner)
+        return [...(await this.load()).values()]
+            .filter((record) => record.owner === owner)
+            .map(FileStore.copy)
     }
 
     /**
@@ -227,7 +235,7 @@ export class FileStore implements VaultStore {
      * ```
      */
     async all(): Promise<SecretRecord[]> {
-        return [...(await this.load()).values()]
+        return [...(await this.load()).values()].map(FileStore.copy)
     }
 
     /**
@@ -247,7 +255,7 @@ export class FileStore implements VaultStore {
         const id = FileStore.id(record.owner, record.name)
         const displaced = records.get(id)
 
-        records.set(id, record)
+        records.set(id, FileStore.copy(record))
         try {
             await this.save()
         } catch (error) {

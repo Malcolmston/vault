@@ -318,6 +318,28 @@ publishes with the `NPM_TOKEN` repository secret.
 `workflow_dispatch` runs everything except the publish, for checking the
 pipeline without spending a version number.
 
+## Stability
+
+1.0 means the surface below is settled, and a breaking change to it needs a
+2.0:
+
+- The `Vault` class and its methods.
+- `VaultStore`, so a store written today keeps working.
+- `KeyProvider`, and the three providers that ship.
+- `SecretRecord`, `SecretSummary`, `PutOptions`, `RotationPolicy`,
+  `VaultEvent`, and the errors.
+- The sealed format, `iv:payload` under a data key. A version that could not
+  open what an earlier one wrote would be a 2.0.
+
+Adding an optional field to an options object, a new store, or a new provider
+is a minor version. Anything that changes what an existing call does is a
+major one.
+
+## Security
+
+What the vault protects against, what it does not, and how to choose a key:
+[SECURITY.md](./SECURITY.md).
+
 ## Development
 
 ```bash

@@ -21,33 +21,37 @@
     "aes-gcm",
     "bun"
   ],
-  "main": "./dist/index.js",
+  "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
     },
     "./stores/memory": {
       "types": "./dist/stores/memory.d.ts",
-      "import": "./dist/stores/memory.js"
+      "import": "./dist/stores/memory.js",
+      "require": "./dist/stores/memory.cjs"
+    },
+    "./stores/file": {
+      "types": "./dist/stores/file.d.ts",
+      "import": "./dist/stores/file.js",
+      "require": "./dist/stores/file.cjs"
     },
     "./stores/sqlite": {
       "types": "./dist/stores/sqlite.d.ts",
       "import": "./dist/stores/sqlite.js"
     },
-    "./package.json": "./package.json",
-    "./stores/file": {
-      "types": "./dist/stores/file.d.ts",
-      "import": "./dist/stores/file.js"
-    }
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
     "docs",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "SECURITY.md"
   ],
   "sideEffects": false,
   "engines": {

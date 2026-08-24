@@ -174,7 +174,7 @@ test("a value sealed under the master directly still opens", async () => {
 // --- entries in the open --------------------------------------------------
 
 test("an entry stored in the open can be read, and says so", async () => {
-    const summary = await vault.put("alice", "region", "eu-west-1", { open: true })
+    const summary = await vault.put("alice", "region", "eu-west-1", { sealed: false })
     expect(summary.isSealed).toBe(false)
     expect(summary.value).toBe("eu-west-1")
 
@@ -302,7 +302,7 @@ test("reseal changes the ciphertext and leaves the value alone", async () => {
     await vault.put("bob", "two", "second")
     const before = (await store.all()).map((record) => record.sealed)
 
-    expect(await vault.reseal()).toBe(2)
+    expect(await vault.reseal()).toEqual({ rekeyed: 2, failed: [] })
 
     const after = (await store.all()).map((record) => record.sealed)
     expect(after.some((sealed, index) => sealed === before[index])).toBe(false)
@@ -312,10 +312,10 @@ test("reseal changes the ciphertext and leaves the value alone", async () => {
 
 test("reseal can be limited to one owner, and skips entries in the open", async () => {
     await vault.put("alice", "sealed", "first")
-    await vault.put("alice", "clear", "second", { open: true })
+    await vault.put("alice", "clear", "second", { sealed: false })
     await vault.put("bob", "other", "third")
 
-    expect(await vault.reseal("alice")).toBe(1)
+    expect(await vault.reseal("alice")).toEqual({ rekeyed: 1, failed: [] })
 })
 
 // --- rekey ----------------------------------------------------------------
@@ -378,7 +378,7 @@ test("rekey gives an envelope to a value that never had one", async () => {
 })
 
 test("rekey skips entries stored in the open", async () => {
-    await vault.put("alice", "clear", "readable", { open: true })
+    await vault.put("alice", "clear", "readable", { sealed: false })
     expect(await vault.rekey(generateKey())).toEqual({ rekeyed: 0, failed: [] })
     expect(await vault.read("alice", "clear")).toBe("readable")
 })
@@ -513,7 +513,7 @@ test("everything the vault does is reported", async () => {
     await watched.put("alice", "token", "one")
     await watched.open("alice", "token")
     await watched.rotate("alice", "token", "two")
-    await watched.put("alice", "clear", "readable", { open: true })
+    await watched.put("alice", "clear", "readable", { sealed: false })
     await watched.read("alice", "clear")
     await watched.remove("alice", "token")
     await watched.rekey(generateKey())
@@ -635,7 +635,7 @@ test("SqliteStore keeps everything across connections to the same file", async (
     const writing = new Vault({ key: KEY, store: first })
     await writing.put("alice", "token", "persisted", { metadata: { kind: "a" } })
     await writing.rotate("alice", "token", "rotated")
-    await writing.put("alice", "clear", "open value", { open: true })
+    await writing.put("alice", "clear", "open value", { sealed: false })
     await writing.put("alice", "locked", "x", {
         final: true,
         expiresAt: new Date(Date.now() + 60_000),
@@ -818,7 +818,7 @@ test("vault-wide operations reach across a SQLite store", async () => {
     await withStore.put("alice", "gone", "x", { expiresAt: new Date(Date.now() - 1) })
 
     // reseal, rekey and purgeExpired all enumerate the whole store.
-    expect(await withStore.reseal()).toBe(3)
+    expect(await withStore.reseal()).toEqual({ rekeyed: 3, failed: [] })
 
     const next = generateKey()
     expect(await withStore.rekey(next)).toEqual({ rekeyed: 3, failed: [] })
@@ -1026,4 +1026,78 @@ test("the file store leans on node:fs, so it is not Bun-only", async () => {
         path.join(import.meta.dir, "stores", "file.ts")
     ).text()
     expect(source).not.toMatch(/\bBun\./)
+})
+
+// --- what 1.0 promises --------------------------------------------------
+
+test("reseal reports what it could not open instead of stopping there", async () => {
+    await vault.put("alice", "good", "readable")
+
+    // Sealed under a key this vault has never held.
+    const stranger = await importKey(generateKey())
+    await store.put({
+        owner: "alice",
+        name: "stranger",
+        sealed: await seal(stranger, "unreachable"),
+        sealedKey: await seal(stranger, generateKey()),
+        plain: null,
+        isSealed: true,
+        isFinal: false,
+        expiresAt: null,
+        history: [],
+        rotation: null,
+        rotatedAt: null,
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+    })
+    await vault.put("alice", "also_good", "readable too")
+
+    const report = await vault.reseal()
+    expect(report.rekeyed).toBe(2)
+    expect(report.failed).toEqual(["alice/stranger"])
+
+    // The two it could open were resealed, not skipped because of the one it could not.
+    expect(await vault.open("alice", "good")).toBe("readable")
+    expect(await vault.open("alice", "also_good")).toBe("readable too")
+})
+
+test("a store hands out records of its own, not the ones it is keeping", async () => {
+    for (const [name, make] of storesUnder(dir)) {
+        const backed = make()
+        const withStore = new Vault({ key: KEY, store: backed })
+        await withStore.put("alice", "token", "value", { metadata: { kind: "a" } })
+
+        // Vandalise what the store handed back.
+        const [taken] = await backed.all()
+        taken!.metadata.kind = "vandalised"
+        taken!.sealed = "iv:nonsense"
+        taken!.history.push({ sealed: "x", sealedKey: null, createdAt: new Date() })
+
+        const [fresh] = await backed.all()
+        expect(fresh?.metadata, name).toEqual({ kind: "a" })
+        expect(fresh?.history, name).toEqual([])
+        expect(await withStore.open("alice", "token"), name).toBe("value")
+    }
+})
+
+test("replacing an entry keeps how it was stored unless told otherwise", async () => {
+    await vault.put("alice", "config", "eu-west-1", { sealed: false })
+    await vault.put("alice", "config", "us-east-1")
+
+    // Still readable: sealedness was inherited, not reset.
+    expect(await vault.read("alice", "config")).toBe("us-east-1")
+
+    // And it can be sealed deliberately.
+    await vault.put("alice", "config", "secret now", { sealed: true })
+    await expect(vault.read("alice", "config")).rejects.toThrow(/cannot be read back/)
+})
+
+test("the timestamp a rotation reports is the one it stored", async () => {
+    await vault.put("alice", "db", "one", { rotation: { kind: "random" } })
+    const rotated = await vault.rotate("alice", "db")
+
+    const [stored] = await vault.list("alice")
+    expect(stored).toBeDefined()
+    expect(rotated.rotatedAt).toEqual(stored!.rotatedAt)
 })

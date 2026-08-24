@@ -450,7 +450,8 @@ export class Vault {
         const now = new Date()
         // An option left out means "as it was": rotating a credential should
         // not quietly forget what kind it is or when it expires.
-        const isSealed = options.open === undefined ? (existing?.isSealed ?? true) : !options.open
+        const isSealed =
+            options.sealed === undefined ? (existing?.isSealed ?? true) : options.sealed
         const history =
             options.keepHistory && existing && existing.sealed
                 ? [
@@ -472,7 +473,7 @@ export class Vault {
             name: clean,
             ...body,
             isSealed,
-            isFinal: options.final === true,
+            isFinal: options.final ?? existing?.isFinal ?? false,
             rotation:
                 options.rotation === undefined
                     ? (existing?.rotation ?? null)
@@ -545,9 +546,10 @@ export class Vault {
         const summary = await this.put(owner, clean, next, { ...options, keepHistory: true })
 
         // Stamped after the fact, so a failed rotation does not look like one.
+        const rotatedAt = new Date()
         const stored = await this.store.get(owner, clean)
-        if (stored) await this.store.put({ ...stored, rotatedAt: new Date() })
-        return { ...summary, rotatedAt: new Date() }
+        if (stored) await this.store.put({ ...stored, rotatedAt })
+        return { ...summary, rotatedAt }
     }
 
     /** The next value an entry's policy calls for. */
@@ -827,17 +829,24 @@ export class Vault {
      * await vault.reseal()         // the whole store
      * ```
      */
-    async reseal(owner?: string): Promise<number> {
+    async reseal(owner?: string): Promise<RekeyReport> {
         const records = owner ? await this.store.list(owner) : await this.store.all()
-        let resealed = 0
+        const report: RekeyReport = { rekeyed: 0, failed: [] }
 
         for (const record of records) {
             if (!record.isSealed || !record.sealed) continue
-            const value = await this.unseal(record.sealed, record.sealedKey)
-            await this.store.put({ ...record, ...(await this.enseal(value)) })
-            resealed += 1
+
+            try {
+                const value = await this.unseal(record.sealed, record.sealedKey)
+                await this.store.put({ ...record, ...(await this.enseal(value)) })
+                report.rekeyed += 1
+            } catch {
+                // One unopenable value must not abort the run and leave the
+                // rest unsealed — same contract as rekey.
+                report.failed.push(`${record.owner}/${record.name}`)
+            }
         }
-        return resealed
+        return report
     }
 
     /**

@@ -288,15 +288,19 @@ export type PutOptions = {
      */
     rotation?: RotationPolicy | null
     /**
-     * Store in the open, readable by `read`.
+     * Whether to encrypt the value.
      *
      * @remarks
-     * For values that belong beside the secrets but are not secret — a host, an
-     * account id. Left out, the entry keeps how it was already stored.
+     * `false` stores it in the clear, where {@link Vault.read} gives it back —
+     * for values that belong beside the secrets but are not secret, like a host
+     * or an account id. Left out, the entry keeps how it was already stored.
      *
-     * @defaultValue false
+     * Named for what it is rather than its opposite, so it does not read as a
+     * relative of {@link Vault.open}, which is a different idea entirely.
+     *
+     * @defaultValue true
      */
-    open?: boolean
+    sealed?: boolean
     /**
      * Refuse every future replacement.
      *

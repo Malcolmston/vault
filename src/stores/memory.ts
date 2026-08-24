@@ -1,5 +1,10 @@
 import type { SecretRecord, VaultStore } from "../types"
 
+/** A record of its own, so callers and the store cannot alter each other's. */
+function copy(record: SecretRecord): SecretRecord {
+    return structuredClone(record)
+}
+
 /**
  * Keeps sealed values in a Map. Handy for tests and short-lived processes.
  *
@@ -71,7 +76,8 @@ export class MemoryStore implements VaultStore {
      * ```
      */
     async get(owner: string, name: string): Promise<SecretRecord | null> {
-        return this.records.get(MemoryStore.key(owner, name)) ?? null
+        const record = this.records.get(MemoryStore.key(owner, name))
+        return record ? copy(record) : null
     }
 
     /**
@@ -83,7 +89,9 @@ export class MemoryStore implements VaultStore {
      * @see {@link MemoryStore.all} when the caller needs every owner's records.
      */
     async list(owner: string): Promise<SecretRecord[]> {
-        return [...this.records.values()].filter((record) => record.owner === owner)
+        return [...this.records.values()]
+            .filter((record) => record.owner === owner)
+            .map(copy)
     }
 
     /**
@@ -97,7 +105,7 @@ export class MemoryStore implements VaultStore {
      * {@link MemoryStore.list}.
      */
     async all(): Promise<SecretRecord[]> {
-        return [...this.records.values()]
+        return [...this.records.values()].map(copy)
     }
 
     /**
@@ -111,8 +119,8 @@ export class MemoryStore implements VaultStore {
      * the vault's job, and it checks before it calls this.
      */
     async put(record: SecretRecord): Promise<SecretRecord> {
-        this.records.set(MemoryStore.key(record.owner, record.name), record)
-        return record
+        this.records.set(MemoryStore.key(record.owner, record.name), copy(record))
+        return copy(record)
     }
 
     /**
