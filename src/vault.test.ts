@@ -19,6 +19,7 @@ import { Database } from "bun:sqlite"
 import { SqliteAuditLog, SqliteStore } from "./stores/sqlite"
 import type { AuditLog, SecretRecord, VaultEvent, VaultStore } from "./types"
 import { chainHash, MemoryAuditLog, verifyChain } from "./audit"
+import { dataUrl, parseDataUrl } from "./dataurl"
 import { randomValue, Vault } from "./vault"
 
 const KEY = generateKey()
@@ -2808,4 +2809,101 @@ test("last-write-wins is still available for a single writer", async () => {
     await relaxed.put("alice", "token", "two")
 
     expect(await relaxed.open("alice", "token")).toBe("two")
+})
+
+
+// --- data URLs ------------------------------------------------------------
+
+test("bytes come back as a data URL of the type they were stored with", async () => {
+    const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])
+    await vault.putBytes("alice", "logo", png, { contentType: "image/png" })
+
+    expect(await vault.openDataUrl("alice", "logo")).toBe(
+        "data:image/png;base64,iVBORw0KGgo="
+    )
+})
+
+test("bytes stored without a type are not claimed to be anything", async () => {
+    await vault.putBytes("alice", "blob", new Uint8Array([1, 2, 3]))
+
+    expect(await vault.openDataUrl("alice", "blob")).toBe(
+        "data:application/octet-stream;base64,AQID"
+    )
+})
+
+test("a text entry becomes a text data URL", async () => {
+    await vault.put("alice", "note", "hello")
+
+    expect(await vault.openDataUrl("alice", "note")).toBe(
+        "data:text/plain;charset=utf-8;base64,aGVsbG8="
+    )
+})
+
+test("a data URL goes in and the same one comes back", async () => {
+    const url = "data:image/png;base64,iVBORw0KGgo="
+    await vault.putDataUrl("alice", "logo", url)
+
+    expect(await vault.openDataUrl("alice", "logo")).toBe(url)
+})
+
+test("a percent-encoded data URL is accepted and stored as bytes", async () => {
+    await vault.putDataUrl("alice", "note", "data:text/plain,hello%20world")
+
+    expect(Buffer.from(await vault.openBytes("alice", "note")).toString()).toBe("hello world")
+    expect(await vault.openDataUrl("alice", "note")).toBe(
+        "data:text/plain;base64,aGVsbG8gd29ybGQ="
+    )
+})
+
+test("a data URL with no media type gets the one the RFC specifies", async () => {
+    expect(parseDataUrl("data:,hi").mediaType).toBe("text/plain;charset=US-ASCII")
+})
+
+test("a type given to putDataUrl wins over the one in the URL", async () => {
+    await vault.putDataUrl("alice", "thing", "data:text/plain;base64,AQID", {
+        contentType: "application/pkcs8",
+    })
+
+    expect(await vault.openDataUrl("alice", "thing")).toBe(
+        "data:application/pkcs8;base64,AQID"
+    )
+})
+
+test("a data URL can be read through a grant", async () => {
+    await vault.putBytes("alice", "logo", new Uint8Array([1]), { contentType: "image/png" })
+    await vault.share("alice", "logo", { with: "bob" })
+
+    expect(await vault.openDataUrl("bob", "logo", { from: "alice" })).toBe(
+        "data:image/png;base64,AQ=="
+    )
+})
+
+test("what is not a data URL is refused", () => {
+    expect(() => parseDataUrl("https://example.test/x")).toThrow(/not a data URL/)
+    expect(() => parseDataUrl("data:image/png;base64")).toThrow(/not a data URL/)
+    expect(() => parseDataUrl("data:not-a-type,x")).toThrow(/not a media type/)
+    expect(() => parseDataUrl("data:image/png;base64,!!!not-base64!!!")).toThrow(
+        /not valid base64/
+    )
+})
+
+test("a media type that is not one is refused on the way out too", () => {
+    expect(() => dataUrl(new Uint8Array([1]), "nonsense")).toThrow(/not a media type/)
+    expect(dataUrl(new Uint8Array([1]), "text/plain;charset=utf-8")).toBe(
+        "data:text/plain;charset=utf-8;base64,AQ=="
+    )
+})
+
+test("a data URL of an entry that is not there fails like any other read", async () => {
+    await expect(vault.openDataUrl("alice", "absent")).rejects.toThrow(VaultError)
+})
+
+test("bytes of every value survive the data URL round trip", async () => {
+    const all = new Uint8Array(256)
+    for (let i = 0; i < 256; i += 1) all[i] = i
+
+    await vault.putBytes("alice", "every", all, { contentType: "application/octet-stream" })
+    const url = await vault.openDataUrl("alice", "every")
+
+    expect(parseDataUrl(url).bytes).toEqual(all)
 })

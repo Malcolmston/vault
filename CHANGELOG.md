@@ -8,6 +8,28 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 2.1.0 — 2026-08-24
+
+Additive.
+
+### Added
+
+- **`openDataUrl` / `putDataUrl`**: an entry to a `data:` URL and back. Bytes
+  carry the `contentType` they were stored with; text becomes
+  `text/plain;charset=utf-8`; bytes stored without a type are called
+  `application/octet-stream` rather than claimed as something they may not be.
+  `putDataUrl` keeps the media type from the URL, so a URL in comes back out
+  identical.
+- **`contentType`** on `putBytes`, kept in the clear beside the other metadata.
+- **`dataUrl` and `parseDataUrl`** on their own, since neither needs a key or a
+  store. `parseDataUrl` takes base64 and percent-encoded forms, and checks the
+  payload actually decodes rather than letting `Buffer.from` quietly skip what
+  it does not recognise.
+
+The URL holds the secret in full, which the documentation says plainly: data
+URLs end up in logs and browser history more readily than a value read through
+`open`.
+
 ## 2.0.0 — 2026-08-24
 
 The compatibility shims come off, and two defaults change to what they should

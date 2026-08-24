@@ -8,6 +8,7 @@
  */
 export * from "./vault"
 export * from "./audit"
+export * from "./dataurl"
 export * from "./crypto"
 export * from "./errors"
 export * from "./providers"

@@ -133,6 +133,27 @@ rotation, sharing, history.
 Bytes cannot be stored with `sealed: false`. They would sit in the database as
 base64 and read back as text, which is a trap rather than a feature.
 
+### As a data URL
+
+To hand a stored thing straight to something that takes one — an `<img src>`, a
+config field wanting an inline certificate:
+
+```ts
+await vault.putBytes("alice", "logo", png, { contentType: "image/png" })
+await vault.openDataUrl("alice", "logo")
+// "data:image/png;base64,iVBORw0KGgo…"
+```
+
+`putDataUrl` is the way back in, keeping the media type from the URL, so what
+goes in comes back out identical. A text entry becomes
+`text/plain;charset=utf-8`; bytes stored without a `contentType` are called
+`application/octet-stream` rather than being claimed as something they might
+not be.
+
+The URL contains the secret. Data URLs have a way of ending up in logs, DOM
+dumps and browser history — treat what comes back the way you would treat
+`open()`.
+
 ## Storage
 
 Four stores ship with the package. If more than one process writes the same

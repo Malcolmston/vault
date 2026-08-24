@@ -1,4 +1,5 @@
 import { generateKey, importKey, open, seal } from "./crypto"
+import { dataUrl, parseDataUrl } from "./dataurl"
 import { VaultError, VaultKeyError } from "./errors"
 import {
     isKeyProvider,
@@ -56,6 +57,15 @@ export const DEFAULT_PAGE_SIZE = 200
 export const BYTES_MARKER = "@vault:bytes"
 
 /**
+ * The metadata key holding an entry's media type.
+ *
+ * @remarks
+ * Beside {@link BYTES_MARKER} and in the clear for the same reason: what kind
+ * of thing an entry is helps a listing without saying what it says.
+ */
+export const TYPE_MARKER = "@vault:type"
+
+/**
  * What ends a name inside a longer string.
  *
  * @remarks
@@ -63,6 +73,19 @@ export const BYTES_MARKER = "@vault:bytes"
  * that *is* a reference from one that merely holds some.
  */
 const NAME_END = /[^A-Za-z0-9._/-]/
+
+/** What {@link Vault.putBytes} accepts beyond a {@link Vault.put}. */
+export type PutBytesOptions = PutOptions & {
+    /**
+     * What the bytes are — `image/png`, `application/pkcs8`.
+     *
+     * @remarks
+     * Stored in the clear with the rest of the metadata, and used by
+     * {@link Vault.openDataUrl}. Left out, the entry is bytes of no stated
+     * kind and a data URL calls them `application/octet-stream`.
+     */
+    contentType?: string
+}
 
 /** What {@link Vault.unbound} found still needing migration. */
 export type UnboundReport = {
@@ -946,9 +969,11 @@ export class Vault {
      * @param owner Whose entry it is.
      * @param name What to call it.
      * @param value The bytes.
-     * @param options As {@link Vault.put}. `sealed: false` is refused — bytes
-     *   kept in the clear would be base64 in the database and read back as
-     *   text, which is a trap rather than a feature.
+     * @param options As {@link Vault.put}, plus `contentType` to say what the
+     *   bytes are — kept in the clear beside the other metadata, and what
+     *   {@link Vault.openDataUrl} puts in the URL. `sealed: false` is refused:
+     *   bytes kept in the clear would be base64 in the database and read back
+     *   as text, which is a trap rather than a feature.
      * @returns The entry, summarised.
      * @throws {@link VaultError} 422 when asked to store bytes in the open, or
      *   when the name is not a legal one.
@@ -964,7 +989,7 @@ export class Vault {
         owner: string,
         name: string,
         value: Uint8Array,
-        options: PutOptions = {}
+        options: PutBytesOptions = {}
     ): Promise<SecretSummary> {
         if (options.sealed === false) {
             throw new VaultError(
@@ -976,7 +1001,13 @@ export class Vault {
 
         return this.put(owner, name, Buffer.from(value).toString("base64"), {
             ...options,
-            metadata: { ...(options.metadata ?? {}), [BYTES_MARKER]: "base64" },
+            metadata: {
+                ...(options.metadata ?? {}),
+                [BYTES_MARKER]: "base64",
+                ...(options.contentType === undefined
+                    ? {}
+                    : { [TYPE_MARKER]: options.contentType }),
+            },
         })
     }
 
@@ -1006,6 +1037,89 @@ export class Vault {
         }
 
         return new Uint8Array(Buffer.from(await this.open(owner, clean, access), "base64"))
+    }
+
+    /**
+     * An entry as a data URL, ready to hand to anything that takes one.
+     *
+     * @remarks
+     * The point is to get from a stored secret to something usable without the
+     * caller doing the base64 and the media type by hand each time — an
+     * `<img src>`, a `fetch`, a config field that wants an inline certificate.
+     *
+     * Bytes use the `contentType` they were stored with, or
+     * `application/octet-stream` when they were stored without one. A text
+     * entry becomes `text/plain;charset=utf-8`, since that is what it is.
+     *
+     * The URL contains the secret. It is as sensitive as the value itself, and
+     * data URLs have a way of ending up in logs, DOM dumps and browser history
+     * — treat what comes back the way you would treat {@link Vault.open}.
+     *
+     * @param owner Whose entry it is.
+     * @param name The entry to encode.
+     * @param access `from` to read something another owner shared.
+     * @returns `data:<type>;base64,<value>`.
+     * @throws {@link VaultError} 404 when there is no such entry.
+     * @throws {@link VaultError} 410 when it has expired.
+     * @throws {@link VaultError} 403 when it belongs to somebody who has not
+     *   shared it.
+     *
+     * @example
+     * ```ts
+     * await vault.putBytes("alice", "logo", png, { contentType: "image/png" })
+     * await vault.openDataUrl("alice", "logo")
+     * // "data:image/png;base64,iVBORw0KGgo…"
+     * ```
+     */
+    async openDataUrl(owner: string, name: string, access: Access = {}): Promise<string> {
+        const clean = this.checkName(name)
+        const record = await this.reach(owner, clean, access.from)
+
+        if (record.metadata[BYTES_MARKER] === undefined) {
+            const text = await this.open(owner, clean, access)
+            return dataUrl(new TextEncoder().encode(text), "text/plain;charset=utf-8")
+        }
+
+        return dataUrl(
+            await this.openBytes(owner, clean, access),
+            record.metadata[TYPE_MARKER] ?? "application/octet-stream"
+        )
+    }
+
+    /**
+     * Stores what a data URL carries, keeping its media type.
+     *
+     * @remarks
+     * The way back in: a file picked in a browser, a certificate pasted as a
+     * URL, anything already in that shape. The media type from the URL becomes
+     * the entry's `contentType`, so {@link Vault.openDataUrl} gives back the
+     * same URL it was handed.
+     *
+     * @param owner Whose entry it is.
+     * @param name What to call it.
+     * @param url The data URL, base64 or percent-encoded.
+     * @param options As {@link Vault.putBytes}. A `contentType` given here wins
+     *   over the one in the URL.
+     * @returns The entry, summarised.
+     * @throws {@link VaultError} 422 when it is not a data URL, or its payload
+     *   will not decode.
+     *
+     * @example
+     * ```ts
+     * await vault.putDataUrl("alice", "logo", "data:image/png;base64,iVBORw0KGgo=")
+     * ```
+     */
+    async putDataUrl(
+        owner: string,
+        name: string,
+        url: string,
+        options: PutBytesOptions = {}
+    ): Promise<SecretSummary> {
+        const { mediaType, bytes } = parseDataUrl(url)
+        return this.putBytes(owner, name, bytes, {
+            ...options,
+            contentType: options.contentType ?? mediaType,
+        })
     }
 
     /**
