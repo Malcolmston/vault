@@ -8,6 +8,47 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 2.4.0 — 2026-08-24
+
+Additive. Using a credential without ever writing it down.
+
+### Added
+
+- **`putCredential` / `credential`.** A token for another service, with the
+  token as the sealed value and everything else — service, account, scopes,
+  which environment variable it belongs in — as metadata in the clear. Expiry
+  is the entry's own `expiresAt`, so an expired credential stops being usable
+  by the same rule as every other entry.
+
+  `npm`, `github`, `gitlab`, `cargo`, `docker` and `pypi` have known
+  conventions for the variable name. Anything else has to say: a guessed
+  variable either does nothing or puts a live token somewhere that was not
+  asking for it.
+
+- **`run(owner, command, { credentials, device })`** spawns a command with
+  those tokens in its environment and nowhere else — no `.npmrc`, no
+  `~/.netrc`, nothing left behind when it fails, nothing in shell history. The
+  command is an array rather than a shell string, so nothing is word-split or
+  expanded. A credential cannot be shadowed by the `env` passed alongside it.
+
+- **`enrolDevice` / `devices`.** An Ed25519 keypair per machine. The audit
+  trail records which device ran what, and the public key is an ordinary
+  `authorized_keys` line, so an enrolled device can be given host access
+  without a second keypair.
+
+- `run` as a `VaultEvent` action.
+
+### What this does not do
+
+Worth stating rather than leaving to be discovered. An environment is readable
+by anything running as the same user — `/proc/<pid>/environ` on Linux. `run`
+keeps a token off disk; it does not hide it from you or from your other
+processes.
+
+And anyone who can open the vault can enrol a device, so a device identity is
+attribution and convenience, not a boundary against somebody holding the master
+key. It says which machine was used, not that the machine was allowed.
+
 ## 2.3.0 — 2026-08-24
 
 Additive. The encryption algorithm is a seam now rather than a constant.

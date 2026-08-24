@@ -154,6 +154,67 @@ The URL contains the secret. Data URLs have a way of ending up in logs, DOM
 dumps and browser history — treat what comes back the way you would treat
 `open()`.
 
+## Credentials for other services
+
+A token for npm, GitLab, anything else. The token is the sealed value;
+everything else about it is metadata, in the clear:
+
+```ts
+await vault.putCredential("alice", "npm-publish", process.env.NPM_TOKEN!, {
+    service: "npm",
+    username: "mstone6969",
+    scopes: ["publish"],
+}, { expiresAt: new Date("2026-11-21") })
+
+await vault.credential("alice", "npm-publish")
+// { service: "npm", env: "NPM_TOKEN", username: "mstone6969", scopes: ["publish"] }
+```
+
+Expiry is the entry's own `expiresAt`, so an expired credential stops opening
+and stops being injected by the same rule as everything else.
+
+`npm`, `github`, `gitlab`, `cargo`, `docker` and `pypi` have known conventions
+for which variable holds the token. Anything else has to say, via `env` — a
+guessed variable name either does nothing or puts a live token somewhere that
+was not asking for it.
+
+## Running commands through the vault
+
+```ts
+await vault.run("alice", ["npm", "publish"], {
+    credentials: ["npm-publish"],
+    device: "laptop",
+})
+```
+
+The token exists in that child process's environment and nowhere else. No
+`.npmrc`, no `~/.netrc`, nothing left behind if the command fails, and nothing
+in shell history. The command is an array, not a shell string, so nothing is
+word-split or expanded.
+
+Be clear about what this does and does not buy. An environment is readable by
+anything running as the same user — `/proc/<pid>/environ` on Linux. It keeps a
+token off disk; it does not hide it from you or from anything else you are
+running.
+
+### Devices
+
+```ts
+const device = await vault.enrolDevice("alice", "laptop")
+device.fingerprint  // "SHA256:…", how the audit trail names it
+device.publicKey    // an ordinary authorized_keys line
+```
+
+An Ed25519 keypair stored like any other secret. Two things it is good for:
+audit entries can say which machine did something, and the public key works as
+an `authorized_keys` line, so an enrolled device can be given access to a host
+without a second keypair.
+
+What it is not: anyone who can open the vault can enrol a device. This is
+attribution and convenience, not a boundary against somebody who holds the
+master key. It tells you which machine was used, not that the machine was
+allowed.
+
 ## SSH keys
 
 The vault can make them, keep the private half, and publish the public one:

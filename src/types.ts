@@ -554,6 +554,7 @@ export type VaultEvent = {
         | "rekey"
         | "share"
         | "unshare"
+        | "run"
         | "denied"
     /** Whose entry it was. Empty for vault-wide actions. */
     owner: string

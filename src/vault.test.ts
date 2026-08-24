@@ -3187,3 +3187,231 @@ test("a value altered in the store fails to open, not just a wrong key", async (
         /could not be opened — wrong key, wrong place, or it has been altered/
     )
 })
+
+
+// --- credentials, devices, and running things -----------------------------
+
+test("a credential keeps its token sealed and everything else in the open", async () => {
+    await vault.putCredential("alice", "npm-publish", "npm_secrettoken", {
+        service: "npm",
+        username: "mstone6969",
+        scopes: ["publish", "read"],
+    })
+
+    const credential = await vault.credential("alice", "npm-publish")
+    expect(credential).toEqual({
+        service: "npm",
+        env: "NPM_TOKEN",
+        username: "mstone6969",
+        scopes: ["publish", "read"],
+    })
+
+    // The token is not among the things a listing can see.
+    const [entry] = await vault.list("alice")
+    expect(JSON.stringify(entry)).not.toContain("npm_secrettoken")
+    expect(await vault.open("alice", "npm-publish")).toBe("npm_secrettoken")
+})
+
+test("a service nobody has a convention for has to say what it wants", async () => {
+    await expect(
+        vault.putCredential("alice", "odd", "t", { service: "some-internal-thing" })
+    ).rejects.toThrow(/knows which environment variable/)
+
+    // Saying so is enough.
+    await vault.putCredential("alice", "odd", "t", {
+        service: "some-internal-thing",
+        env: "INTERNAL_TOKEN",
+    })
+    expect((await vault.credential("alice", "odd")).env).toBe("INTERNAL_TOKEN")
+})
+
+test("an entry that is not a credential says so", async () => {
+    await vault.put("alice", "plain", "x")
+    await expect(vault.credential("alice", "plain")).rejects.toThrow(/not a credential/)
+})
+
+test("a command is run with the token in its environment and nowhere else", async () => {
+    await vault.putCredential("alice", "npm", "npm_livetoken", { service: "npm" })
+
+    const result = await vault.run(
+        "alice",
+        [process.execPath, "-e", "console.log(process.env.NPM_TOKEN)"],
+        { credentials: ["npm"], capture: true }
+    )
+
+    expect(result.code).toBe(0)
+    expect(result.stdout.trim()).toBe("npm_livetoken")
+    // The parent's own environment was not touched.
+    expect(process.env.NPM_TOKEN).toBeUndefined()
+})
+
+test("a credential's extra environment comes along, and the parent's survives", async () => {
+    await vault.putCredential("alice", "npm", "tok", {
+        service: "npm",
+        extra: { NPM_CONFIG_REGISTRY: "https://registry.internal" },
+    })
+
+    const result = await vault.run(
+        "alice",
+        [
+            process.execPath,
+            "-e",
+            "console.log([process.env.NPM_CONFIG_REGISTRY, Boolean(process.env.PATH)].join(' '))",
+        ],
+        { credentials: ["npm"], capture: true }
+    )
+
+    expect(result.stdout.trim()).toBe("https://registry.internal true")
+})
+
+test("several credentials can be injected at once", async () => {
+    await vault.putCredential("alice", "npm", "npm-tok", { service: "npm" })
+    await vault.putCredential("alice", "gl", "gl-tok", { service: "gitlab" })
+
+    const result = await vault.run(
+        "alice",
+        [
+            process.execPath,
+            "-e",
+            "console.log(process.env.NPM_TOKEN + ' ' + process.env.GITLAB_TOKEN)",
+        ],
+        { credentials: ["npm", "gl"], capture: true }
+    )
+
+    expect(result.stdout.trim()).toBe("npm-tok gl-tok")
+})
+
+test("a credential cannot be shadowed by the env passed alongside it", async () => {
+    await vault.putCredential("alice", "npm", "the-real-token", { service: "npm" })
+
+    const result = await vault.run(
+        "alice",
+        [process.execPath, "-e", "console.log(process.env.NPM_TOKEN)"],
+        { credentials: ["npm"], env: { NPM_TOKEN: "an-impostor" }, capture: true }
+    )
+
+    expect(result.stdout.trim()).toBe("the-real-token")
+})
+
+test("an expired credential is not injected", async () => {
+    await vault.putCredential(
+        "alice",
+        "npm",
+        "tok",
+        { service: "npm" },
+        { expiresAt: new Date(Date.now() - 1) }
+    )
+
+    await expect(
+        vault.run("alice", [process.execPath, "-e", ""], { credentials: ["npm"] })
+    ).rejects.toThrow(/expired/)
+})
+
+test("a credential that is not there stops the command before it starts", async () => {
+    await expect(
+        vault.run("alice", [process.execPath, "-e", "console.log('ran')"], {
+            credentials: ["absent"],
+        })
+    ).rejects.toThrow(VaultError)
+})
+
+test("the command's own failure is reported, not thrown", async () => {
+    const result = await vault.run("alice", [process.execPath, "-e", "process.exit(3)"], {
+        capture: true,
+    })
+    expect(result.code).toBe(3)
+})
+
+test("a command that cannot be started is an error", async () => {
+    await expect(vault.run("alice", ["./definitely-not-a-program"])).rejects.toThrow()
+    await expect(vault.run("alice", [])).rejects.toThrow(/no command to run/)
+})
+
+test("output can be let through instead of captured", async () => {
+    const result = await vault.run("alice", [process.execPath, "-e", "console.log('hi')"])
+    expect(result.code).toBe(0)
+    // Not captured, so it went to this process's own output rather than here.
+    expect(result.stdout).toBe("")
+})
+
+test("what ran, and on which device, is recorded", async () => {
+    const audit = new MemoryAuditLog()
+    const watched = new Vault({ key: KEY, store, audit })
+    await watched.putCredential("alice", "npm", "tok", { service: "npm" })
+
+    await watched.run("alice", [process.execPath, "-e", ""], {
+        credentials: ["npm"],
+        device: "laptop",
+        capture: true,
+    })
+
+    const [ran] = await audit.entries({ action: "run" })
+    expect(ran).toMatchObject({ owner: "alice", name: "npm", by: "laptop" })
+    expect(ran?.detail).toBe(process.execPath)
+    // And the open it needed to do the injection is recorded too.
+    expect(await audit.entries({ action: "open" })).toHaveLength(1)
+})
+
+test("a device gets a key of its own, and can be listed", async () => {
+    const device = await vault.enrolDevice("alice", "laptop")
+
+    expect(device.name).toBe("laptop")
+    expect(device.fingerprint).toMatch(/^SHA256:/)
+    expect(device.publicKey).toMatch(/^ssh-ed25519 \S+ laptop@device$/)
+
+    expect(await vault.devices("alice")).toEqual([device])
+})
+
+test("a device's key is a real SSH key, usable as one", async () => {
+    await vault.enrolDevice("alice", "laptop")
+
+    const privateKey = await vault.openSshKey("alice", "laptop")
+    const [code, derived] = await askSshKeygen(privateKey, ["-y"])
+
+    expect(code).toBe(0)
+    expect(derived).toBe((await vault.sshPublicKey("alice", "laptop")).publicKey)
+})
+
+test("devices are listed apart from everything else the owner keeps", async () => {
+    await vault.enrolDevice("alice", "laptop")
+    await vault.putSshKey("alice", "deploy")
+    await vault.put("alice", "password", "x")
+
+    expect((await vault.devices("alice")).map((device) => device.name)).toEqual(["laptop"])
+})
+
+test("a device can be removed like any other entry", async () => {
+    await vault.enrolDevice("alice", "laptop")
+    expect(await vault.remove("alice", "laptop")).toBe(true)
+    expect(await vault.devices("alice")).toEqual([])
+})
+
+test("a credential can be shared, and used by whoever it was shared with", async () => {
+    await vault.putCredential("alice", "npm", "shared-token", { service: "npm" })
+    await vault.share("alice", "npm", { with: "bob" })
+
+    expect((await vault.credential("bob", "npm", { from: "alice" })).service).toBe("npm")
+})
+
+
+test("standard error is captured too, apart from standard output", async () => {
+    const result = await vault.run(
+        "alice",
+        [process.execPath, "-e", "console.log('out'); console.error('err')"],
+        { capture: true }
+    )
+
+    expect(result.stdout.trim()).toBe("out")
+    expect(result.stderr.trim()).toBe("err")
+})
+
+test("a command killed by a signal reports a failure, not a success", async () => {
+    const result = await vault.run(
+        "alice",
+        [process.execPath, "-e", "process.kill(process.pid, 'SIGKILL')"],
+        { capture: true }
+    )
+
+    // No exit code when a signal ends it, and nothing here should invent a 0.
+    expect(result.code).not.toBe(0)
+})

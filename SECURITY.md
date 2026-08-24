@@ -31,6 +31,13 @@ way, so neither can be told from the other.
 - **Timing.** Nothing here is written to run in constant time.
 - **Metadata you choose to store.** It is deliberately in the clear. Do not put
   a secret in it.
+- **Other processes running as you.** A command started by `run` gets its
+  token in its environment, which anything running as the same user can read —
+  `/proc/<pid>/environ` on Linux. It keeps a token off disk and out of shell
+  history; it does not hide it from the rest of your session.
+- **A device identity, as proof of anything.** Anyone who can open the vault
+  can enrol a device. `enrolDevice` gives you attribution — which machine did
+  something — not a boundary against somebody who already holds the key.
 - **Someone who can delete.** Values tied to their entry cannot be moved or
   swapped, and a thinned audit trail can be spotted — but nothing here stops a
   writer with database access from deleting rows outright, or from re-hashing a

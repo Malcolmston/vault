@@ -1,5 +1,12 @@
 import { generateKey, importKey, open, seal } from "./crypto"
+import { spawn } from "node:child_process"
 import { DEFAULT_CIPHER, frame, unframe, type Cipher } from "./cipher"
+import {
+    fromMetadata,
+    toMetadata,
+    variableFor,
+    type Credential,
+} from "./credential"
 import { dataUrl, parseDataUrl } from "./dataurl"
 import { VaultError, VaultKeyError } from "./errors"
 import { generateSshKey } from "./ssh"
@@ -79,6 +86,9 @@ export const SSH_PUBLIC = "@vault:ssh-public"
 /** The metadata key holding an SSH entry's fingerprint. */
 export const SSH_FINGERPRINT = "@vault:ssh-fingerprint"
 
+/** The metadata key marking an entry as a device's identity key. */
+export const DEVICE_MARKER = "@vault:device"
+
 /**
  * What ends a name inside a longer string.
  *
@@ -87,6 +97,50 @@ export const SSH_FINGERPRINT = "@vault:ssh-fingerprint"
  * that *is* a reference from one that merely holds some.
  */
 const NAME_END = /[^A-Za-z0-9._/-]/
+
+/** What {@link Vault.run} may be told. */
+export type RunOptions = {
+    /** Entries to put in the environment, by name. */
+    credentials?: string[]
+    /** Which enrolled device is running it, for the audit trail. */
+    device?: string
+    /** More environment, set before the credentials so it cannot shadow one. */
+    env?: Record<string, string>
+    /** What directory to run in. */
+    cwd?: string
+    /**
+     * Collect the output instead of letting it through to this process's own.
+     *
+     * @remarks
+     * Off by default: a command run this way is usually one whose output the
+     * person wants to see as it happens. Capturing puts it in the result
+     * instead — where, note, it may well contain whatever the command decided
+     * to print about its own credentials.
+     *
+     * @defaultValue false
+     */
+    capture?: boolean
+}
+
+/** How a command run through the vault turned out. */
+export type RunResult = {
+    /** What it exited with. Non-zero is the command's failure, not the vault's. */
+    code: number
+    /** Its standard output, when `capture` was asked for. Empty otherwise. */
+    stdout: string
+    /** Its standard error, when `capture` was asked for. Empty otherwise. */
+    stderr: string
+}
+
+/** An enrolled machine. */
+export type Device = {
+    /** What it is called in the vault, and the entry its key is under. */
+    name: string
+    /** Its `SHA256:…` fingerprint, which is how the audit trail names it. */
+    fingerprint: string
+    /** Its public key, as an `authorized_keys` line. */
+    publicKey: string
+}
 
 /** The public half of a stored SSH key. */
 export type SshPublic = {
@@ -1344,6 +1398,130 @@ export class Vault {
             throw new VaultError(`"${clean}" is not an SSH key.`)
         }
         return { publicKey, fingerprint: record.metadata[SSH_FINGERPRINT] ?? "" }
+    }
+
+    /**
+     * Stores a credential for another service — an npm token, a GitLab PAT.
+     *
+     * @remarks
+     * The token is the entry's value and is sealed like anything else.
+     * Everything else about it — which service, which account, which scopes,
+     * when it runs out — is metadata, in the clear, because none of that is the
+     * secret and all of it is what a listing needs to be able to say without
+     * opening anything.
+     *
+     * Expiry is the entry's own `expiresAt`, so an expired credential stops
+     * opening and stops being injected, by the same rule as every other entry.
+     *
+     * @param owner Whose credential it is.
+     * @param name What to call it.
+     * @param token The secret itself.
+     * @param credential Which service it is for, and what else is worth
+     *   recording.
+     * @param options As {@link Vault.put} — `expiresAt` is the useful one here.
+     * @returns The entry, summarised.
+     * @throws {@link VaultError} 422 when nothing knows which environment
+     *   variable the service reads, and the credential did not say.
+     *
+     * @example
+     * ```ts
+     * await vault.putCredential("alice", "npm-publish", process.env.NPM_TOKEN!, {
+     *     service: "npm",
+     *     username: "mstone6969",
+     *     scopes: ["publish"],
+     * }, { expiresAt: new Date("2026-11-21") })
+     * ```
+     */
+    async putCredential(
+        owner: string,
+        name: string,
+        token: string,
+        credential: Credential,
+        options: PutOptions = {}
+    ): Promise<SecretSummary> {
+        return this.put(owner, name, token, {
+            ...options,
+            metadata: { ...(options.metadata ?? {}), ...toMetadata(credential) },
+        })
+    }
+
+    /**
+     * What a credential is for, without opening it.
+     *
+     * @param owner Whose credential it is.
+     * @param name The entry to ask about.
+     * @param access `from` to read one another owner shared.
+     * @returns The credential, minus its token — that comes out of `open`.
+     * @throws {@link VaultError} 404 when there is no such entry.
+     * @throws {@link VaultError} 422 when the entry is not a credential.
+     */
+    async credential(owner: string, name: string, access: Access = {}): Promise<Credential> {
+        const clean = this.checkName(name)
+        const record = await this.reach(owner, clean, access.from)
+        return fromMetadata(record.metadata)
+    }
+
+    /**
+     * Gives this machine an identity of its own.
+     *
+     * @remarks
+     * An Ed25519 keypair, stored like any other secret, whose fingerprint names
+     * the device. Two things it is good for: audit entries can say which
+     * machine did something, and the public key is an ordinary
+     * `authorized_keys` line, so an enrolled device can be given access to a
+     * host without a second keypair.
+     *
+     * Be clear about what it is not. Anyone who can open this vault can enrol a
+     * device, so this is attribution and convenience, not a boundary against
+     * somebody holding the master key. It tells you which machine was used, not
+     * that the machine was allowed.
+     *
+     * @param owner Whose device it is.
+     * @param name What to call it — usually the hostname.
+     * @param options `comment` for the key, plus anything {@link Vault.put}
+     *   takes.
+     * @returns The device's name and fingerprint, and its public key.
+     * @throws {@link VaultError} 409 when a device of that name is final.
+     *
+     * @example
+     * ```ts
+     * const device = await vault.enrolDevice("alice", "laptop")
+     * device.fingerprint  // "SHA256:…", how the audit trail names it
+     * ```
+     */
+    async enrolDevice(
+        owner: string,
+        name: string,
+        { comment, ...options }: PutOptions & { comment?: string } = {}
+    ): Promise<Device> {
+        const clean = this.checkName(name)
+        const entry = await this.putSshKey(owner, clean, {
+            ...options,
+            comment: comment ?? `${clean}@device`,
+            metadata: { ...(options.metadata ?? {}), [DEVICE_MARKER]: "ed25519" },
+        })
+
+        return {
+            name: clean,
+            fingerprint: entry.metadata[SSH_FINGERPRINT] ?? "",
+            publicKey: entry.metadata[SSH_PUBLIC] ?? "",
+        }
+    }
+
+    /**
+     * The devices one owner has enrolled.
+     *
+     * @param owner Whose devices to list.
+     * @returns Each device's name, fingerprint and public key.
+     */
+    async devices(owner: string): Promise<Device[]> {
+        return (await this.list(owner))
+            .filter((entry) => entry.metadata[DEVICE_MARKER] !== undefined)
+            .map((entry) => ({
+                name: entry.name,
+                fingerprint: entry.metadata[SSH_FINGERPRINT] ?? "",
+                publicKey: entry.metadata[SSH_PUBLIC] ?? "",
+            }))
     }
 
     /**
@@ -2703,6 +2881,83 @@ export class Vault {
     }
 
     /**
+     * Runs a command with credentials from the vault in its environment.
+     *
+     * @remarks
+     * The point is to use a token without ever writing it down: no `.npmrc`,
+     * no `~/.netrc`, nothing left behind if the command fails. The token exists
+     * in the child process's environment and nowhere else, and this process
+     * never writes it to disk.
+     *
+     * Each named credential contributes its token under the variable it says it
+     * wants, plus whatever non-secret `extra` it carries. An expired credential
+     * refuses, by the same rule that stops an expired entry opening.
+     *
+     * What this does not do: an environment is readable by anything running as
+     * the same user, through `/proc/<pid>/environ` on Linux or `ps -E` on some
+     * systems. It keeps a token off disk and out of shell history. It does not
+     * hide it from you, or from anything else you are running.
+     *
+     * @param owner Whose credentials to use.
+     * @param command The command and its arguments. Not a shell string — it is
+     *   passed straight to the process, so nothing is word-split or expanded,
+     *   and a token in an argument cannot be mangled by a shell.
+     * @param options `credentials` names the entries to inject; `device`
+     *   records which machine ran it in the audit trail; `env` adds more;
+     *   `cwd` sets the directory; `capture` collects output instead of letting
+     *   it through.
+     * @returns The exit code, and the output when `capture` asked for it.
+     * @throws {@link VaultError} 404 when a named credential is not there.
+     * @throws {@link VaultError} 410 when one has expired.
+     * @throws {@link VaultError} 422 when one is not a credential.
+     *
+     * @example
+     * ```ts
+     * await vault.putCredential("alice", "npm", token, { service: "npm" })
+     *
+     * const { code } = await vault.run("alice", ["npm", "publish"], {
+     *     credentials: ["npm"],
+     *     device: "laptop",
+     * })
+     * ```
+     */
+    async run(owner: string, command: string[], options: RunOptions = {}): Promise<RunResult> {
+        const [program, ...args] = command
+        if (!program) throw new VaultError("There is no command to run.")
+
+        const { credentials = [], device, env = {}, cwd, capture = false } = options
+        const injected: Record<string, string> = {}
+        const used: string[] = []
+
+        for (const name of credentials) {
+            const clean = this.checkName(name)
+            const record = await this.require(owner, clean)
+            const credential = fromMetadata(record.metadata)
+
+            injected[variableFor(credential)] = await this.open(owner, clean)
+            Object.assign(injected, credential.extra ?? {})
+            used.push(clean)
+        }
+
+        await this.record({
+            action: "run",
+            owner,
+            name: used.join(",") || null,
+            by: device,
+            detail: program,
+        })
+
+        return spawnWith(program, args, {
+            // The parent's environment first, so PATH and HOME survive; ours
+            // last, so a credential is never overridden by whatever was already
+            // set for it.
+            env: { ...process.env, ...env, ...injected },
+            cwd,
+            capture,
+        })
+    }
+
+    /**
      * Deletes entries whose time is up. Returns how many went.
      *
      * @param now The moment to judge against. Pass a later one to see what a
@@ -2737,4 +2992,45 @@ export class Vault {
         }
         return expired.length
     }
+}
+
+/**
+ * Starts a child process and waits for it.
+ *
+ * @remarks
+ * `node:child_process` rather than `Bun.spawn`, because the package's main
+ * entry has to load on Node as well. Arguments are passed as an array and no
+ * shell is involved, so nothing in a command or a token is word-split, globbed
+ * or expanded.
+ *
+ * @param program What to run.
+ * @param args Its arguments.
+ * @param options The environment, directory, and whether to collect output.
+ * @returns The exit code and, if collected, the output.
+ */
+function spawnWith(
+    program: string,
+    args: string[],
+    options: { env: NodeJS.ProcessEnv; cwd: string | undefined; capture: boolean }
+): Promise<RunResult> {
+    return new Promise((settle, fail) => {
+        const child = spawn(program, args, {
+            env: options.env,
+            cwd: options.cwd,
+            stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit",
+            shell: false,
+        })
+
+        let stdout = ""
+        let stderr = ""
+        child.stdout?.on("data", (chunk: Buffer) => (stdout += chunk.toString()))
+        child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()))
+
+        child.on("error", fail)
+        // A command killed by a signal has no exit code; 128 + the signal
+        // number is what a shell reports, and nothing here should invent a 0.
+        child.on("close", (code, signal) =>
+            settle({ code: code ?? (signal ? 128 : 1), stdout, stderr })
+        )
+    })
 }
