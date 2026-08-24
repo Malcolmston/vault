@@ -8,6 +8,36 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 2.3.0 — 2026-08-24
+
+Additive. The encryption algorithm is a seam now rather than a constant.
+
+### Added
+
+- **`VaultOptions.cipher`** sets what new values are sealed with, and
+  **`ciphers`** lists what the vault can still read. Values carry the name of
+  the algorithm that sealed them, so old and new coexist and `reseal()` is the
+  migration — it rewrites each value under whatever the vault currently writes
+  with.
+- **`ciphersInUse()`** counts what the stored values are actually under, so a
+  migration can be seen to have finished. It reads only the marker, so it opens
+  nothing and needs no key.
+- **`aesGcm(128 | 192 | 256)`**, and the `Cipher` interface for an algorithm
+  that does not ship here.
+
+Values sealed with the default carry no marker, exactly as every earlier
+version wrote them, so a vault that ignores this is byte-for-byte unchanged.
+
+A cipher never sees the entry it belongs to. The tie from 1.4 that stops a
+value being moved between entries lives on the data key, not the value, so a
+plugged-in algorithm cannot weaken it by leaving something out — there is a
+test that plugs in a deliberately naive cipher and shows the swap still fails.
+
+Two things the documentation says plainly rather than implying: check the
+algorithm exists on your runtime first, since Bun has no `chacha20-poly1305`
+and a vault that cannot open its own values is not recoverable; and nothing
+about AES-256 is known to be weak, so if you have no reason to move, do not.
+
 ## 2.2.0 — 2026-08-24
 
 Additive.

@@ -21,6 +21,7 @@ import type { AuditLog, SecretRecord, VaultEvent, VaultStore } from "./types"
 import { chainHash, MemoryAuditLog, verifyChain } from "./audit"
 import { dataUrl, parseDataUrl } from "./dataurl"
 import { generateSshKey, sshFingerprint, sshPublicLine } from "./ssh"
+import { aesGcm, unframe, type Cipher } from "./cipher"
 import { randomValue, Vault } from "./vault"
 
 const KEY = generateKey()
@@ -3043,4 +3044,146 @@ test("an SSH key can expire and carry metadata like anything else", async () => 
     })
 
     await expect(vault.openSshKey("alice", "deploy")).rejects.toThrow(/expired/)
+})
+
+
+// --- choosing the algorithm -----------------------------------------------
+
+test("the default algorithm writes exactly what it always wrote", async () => {
+    await vault.put("alice", "db", "hunter2")
+    const record = (await store.get("alice", "db"))!
+
+    // No marker: the format is unchanged, so nothing already stored moved.
+    expect(record.sealed.startsWith("$")).toBe(false)
+    expect(await vault.ciphersInUse()).toEqual({ A256GCM: 1 })
+})
+
+test("another algorithm is recorded with the value", async () => {
+    const small = new Vault({ key: KEY, store, cipher: aesGcm(128) })
+    await small.put("alice", "db", "hunter2")
+
+    const record = (await store.get("alice", "db"))!
+    expect(record.sealed.startsWith("$A128GCM$")).toBe(true)
+    expect(await small.open("alice", "db")).toBe("hunter2")
+    expect(await small.ciphersInUse()).toEqual({ A128GCM: 1 })
+})
+
+test("every AES size works and round trips", async () => {
+    for (const bits of [128, 192, 256] as const) {
+        const one = new Vault({ key: KEY, store: new MemoryStore(), cipher: aesGcm(bits) })
+        await one.put("alice", "db", `sealed with ${bits}`)
+        expect(await one.open("alice", "db")).toBe(`sealed with ${bits}`)
+    }
+})
+
+test("a vault reads what it wrote under a different algorithm before", async () => {
+    const before = new Vault({ key: KEY, store, cipher: aesGcm(128) })
+    await before.put("alice", "old", "written earlier")
+
+    // Writing 256 now, but 128 must still open — the default and the current
+    // cipher are always readable.
+    const after = new Vault({ key: KEY, store, ciphers: [aesGcm(128)] })
+    await after.put("alice", "new", "written now")
+
+    expect(await after.open("alice", "old")).toBe("written earlier")
+    expect(await after.open("alice", "new")).toBe("written now")
+    expect(await after.ciphersInUse()).toEqual({ A128GCM: 1, A256GCM: 1 })
+})
+
+test("reseal is what moves values onto the new algorithm", async () => {
+    await vault.put("alice", "one", "x")
+    await vault.put("alice", "two", "y")
+    expect(await vault.ciphersInUse()).toEqual({ A256GCM: 2 })
+
+    const moving = new Vault({ key: KEY, store, cipher: aesGcm(128) })
+    expect((await moving.reseal()).rekeyed).toBe(2)
+
+    expect(await moving.ciphersInUse()).toEqual({ A128GCM: 2 })
+    expect(await moving.open("alice", "one")).toBe("x")
+})
+
+test("a value whose algorithm the vault does not have says so plainly", async () => {
+    const odd: Cipher = {
+        name: "MADEUP",
+        generateKey: () => Buffer.alloc(32).toString("base64"),
+        seal: async (_material, plaintext) => Buffer.from(plaintext).toString("base64"),
+        open: async (_material, payload) => Buffer.from(payload, "base64").toString(),
+    }
+    const writer = new Vault({ key: KEY, store, cipher: odd })
+    await writer.put("alice", "db", "hunter2")
+
+    // A vault that was never told about it cannot guess.
+    await expect(vault.open("alice", "db")).rejects.toThrow(
+        /sealed with "MADEUP", which this vault does not have/
+    )
+    // Told about it, it reads fine.
+    const knowing = new Vault({ key: KEY, store, ciphers: [odd] })
+    expect(await knowing.open("alice", "db")).toBe("hunter2")
+})
+
+test("a custom cipher is enough on its own — the tie is on the data key", async () => {
+    // This cipher authenticates nothing about the entry, and yet a value still
+    // cannot be moved between entries, because the data key is what is bound.
+    const naive: Cipher = {
+        name: "NAIVE",
+        generateKey: () => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64"),
+        seal: async (_m, plaintext) => Buffer.from(plaintext).toString("base64"),
+        open: async (_m, payload) => Buffer.from(payload, "base64").toString(),
+    }
+    const plain = new Vault({ key: KEY, store, cipher: naive })
+
+    await plain.put("alice", "payroll", "SECRET")
+    await plain.put("bob", "junk", "bob's")
+
+    const alice = (await store.get("alice", "payroll"))!
+    const bob = (await store.get("bob", "junk"))!
+    await store.put({ ...bob, sealed: alice.sealed, sealedKey: alice.sealedKey })
+
+    await expect(plain.open("bob", "junk")).rejects.toThrow(VaultKeyError)
+})
+
+test("a value claiming an algorithm in a shape we do not use is refused", () => {
+    expect(() => unframe("$not a name$payload")).toThrow(/does not say what sealed it/)
+    expect(() => unframe("$unterminated")).toThrow(/does not say what sealed it/)
+    expect(unframe("iv:payload")).toEqual({ name: "A256GCM", payload: "iv:payload" })
+})
+
+test("an AES key of the wrong length for its size is refused", async () => {
+    const cipher = aesGcm(256)
+    const short = Buffer.alloc(16).toString("base64")
+
+    await expect(cipher.seal(short, "x")).rejects.toThrow(/must be 32 bytes; this one is 16/)
+})
+
+test("AES has only the three sizes", () => {
+    expect(() => aesGcm(64 as unknown as 128)).toThrow(/no 64-bit key size/)
+})
+
+test("a payload that is not iv:payload is refused", async () => {
+    const cipher = aesGcm(256)
+    await expect(cipher.open(cipher.generateKey(), "nonsense")).rejects.toThrow(
+        /must look like iv:payload/
+    )
+})
+
+test("entries in the open are not counted as sealed with anything", async () => {
+    await vault.put("alice", "region", "eu-west-1", { sealed: false })
+    expect(await vault.ciphersInUse()).toEqual({})
+})
+
+
+test("a value altered in the store fails to open, not just a wrong key", async () => {
+    await vault.put("alice", "db", "hunter2")
+    const record = (await store.get("alice", "db"))!
+
+    // The data key is untouched; only the value's ciphertext is edited, so
+    // this exercises the cipher's own authentication rather than the wrapper's.
+    const [iv, body] = record.sealed.split(":")
+    const bytes = Buffer.from(body!, "base64")
+    bytes[0] = bytes[0]! ^ 0xff
+    await store.put({ ...record, sealed: `${iv}:${bytes.toString("base64")}` })
+
+    await expect(vault.open("alice", "db")).rejects.toThrow(
+        /could not be opened — wrong key, wrong place, or it has been altered/
+    )
 })

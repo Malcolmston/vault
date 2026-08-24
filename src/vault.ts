@@ -1,4 +1,5 @@
 import { generateKey, importKey, open, seal } from "./crypto"
+import { DEFAULT_CIPHER, frame, unframe, type Cipher } from "./cipher"
 import { dataUrl, parseDataUrl } from "./dataurl"
 import { VaultError, VaultKeyError } from "./errors"
 import { generateSshKey } from "./ssh"
@@ -378,6 +379,29 @@ export type VaultOptions = {
      */
     allowUnbound?: boolean
     /**
+     * What to seal new values with.
+     *
+     * @remarks
+     * AES-256-GCM unless you say otherwise, which is what every version before
+     * 2.3 used and what values already written are under. Changing this changes
+     * only what is written from now on; `reseal()` moves the existing ones.
+     *
+     * @defaultValue {@link DEFAULT_CIPHER}
+     * @see {@link Vault.ciphersInUse} to see how far a migration has got.
+     */
+    cipher?: Cipher
+    /**
+     * Algorithms this vault should be able to read but will not write.
+     *
+     * @remarks
+     * What you need while migrating, and afterwards for as long as anything
+     * might still be under the old one. The default and whatever `cipher` is
+     * set to are always readable without being listed here.
+     *
+     * @defaultValue none
+     */
+    ciphers?: Cipher[]
+    /**
      * Where to write an audit trail that outlives the process.
      *
      * @remarks
@@ -582,6 +606,9 @@ export class Vault {
     private readonly auditRequired: boolean
     private readonly pageSize: number
     private readonly allowUnbound: boolean
+    private readonly cipher: Cipher
+    /** Every algorithm this vault can read, by name. */
+    private readonly ciphers: Map<string, Cipher>
     /** The prefix {@link Vault.resolve} treats as a reference. */
     readonly prefix: string
 
@@ -603,6 +630,8 @@ export class Vault {
         audit,
         pageSize = DEFAULT_PAGE_SIZE,
         allowUnbound = false,
+        cipher = DEFAULT_CIPHER,
+        ciphers = [],
     }: VaultOptions) {
         this.current = toWrapper(key)
         this.retiredWrappers = previousKeys.map(toWrapper)
@@ -618,6 +647,13 @@ export class Vault {
         this.auditRequired = settings.required ?? true
         this.pageSize = pageSize
         this.allowUnbound = allowUnbound
+        this.cipher = cipher
+        // Everything it may need to read: the default, whatever it writes with,
+        // and anything else named. A vault that could not read what it wrote
+        // last month would be a poor vault.
+        this.ciphers = new Map(
+            [DEFAULT_CIPHER, ...ciphers, cipher].map((one) => [one.name, one])
+        )
     }
 
 
@@ -733,7 +769,8 @@ export class Vault {
             return this.unsealWithMaster(sealed, undefined)
         }
 
-        return open(await importKey(await this.rewrap(sealedKey, binding)), sealed)
+        const { cipher, payload } = this.sealedWith(sealed)
+        return cipher.open(await this.rewrap(sealedKey, binding), payload)
     }
 
     /** Seals a value under a fresh data key, and that key under the master. */
@@ -741,15 +778,35 @@ export class Vault {
         value: string,
         binding: string
     ): Promise<{ sealed: string; sealedKey: string }> {
-        const material = generateKey()
-        const dataKey = await importKey(material)
+        const material = this.cipher.generateKey()
         return {
-            sealed: await seal(dataKey, value),
+            sealed: frame(this.cipher, await this.cipher.seal(material, value)),
             // The data key is what is tied to the entry. Binding it is enough:
             // the value cannot be opened without its own key, so ciphertext
             // moved to another entry is ciphertext nobody can unwrap.
             sealedKey: await this.current.wrap(material, binding),
         }
+    }
+
+    /**
+     * The algorithm a stored value was sealed with.
+     *
+     * @param stored The value as the store holds it.
+     * @returns The cipher, and the payload to hand it.
+     * @throws {@link VaultKeyError} 500 when nothing this vault knows about
+     *   wrote it — which usually means a cipher was not passed to `ciphers`.
+     */
+    private sealedWith(stored: string): { cipher: Cipher; payload: string } {
+        const { name, payload } = unframe(stored)
+        const cipher = this.ciphers.get(name)
+
+        if (!cipher) {
+            throw new VaultKeyError(
+                `That value was sealed with "${name}", which this vault does not have. ` +
+                    `Pass it in the vault's "ciphers".`
+            )
+        }
+        return { cipher, payload }
     }
 
     /**
@@ -2607,6 +2664,42 @@ export class Vault {
         }
 
         return { untied, unopenable }
+    }
+
+    /**
+     * Which algorithms the stored values are actually sealed with.
+     *
+     * @remarks
+     * What to check after changing {@link VaultOptions.cipher} and running
+     * `reseal()`, to see whether anything is still under the old one. Reading
+     * only the marker, so it opens nothing and needs no key — but it does walk
+     * the whole vault, so it is a migration tool rather than something to call
+     * on a request.
+     *
+     * Entries kept in the open are not counted: there is nothing sealed about
+     * them to have an algorithm.
+     *
+     * @returns How many entries each algorithm holds, by name.
+     *
+     * @example
+     * ```ts
+     * await vault.ciphersInUse()   // { A256GCM: 412 }
+     *
+     * const moving = new Vault({ key, store, cipher: aesGcm(128) })
+     * await moving.reseal()
+     * await moving.ciphersInUse()  // { A128GCM: 412 }
+     * ```
+     */
+    async ciphersInUse(): Promise<Record<string, number>> {
+        const counts: Record<string, number> = {}
+
+        for await (const record of this.scan()) {
+            if (!record.isSealed || !record.sealed) continue
+            const { name } = unframe(record.sealed)
+            counts[name] = (counts[name] ?? 0) + 1
+        }
+
+        return counts
     }
 
     /**

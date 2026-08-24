@@ -278,6 +278,43 @@ gives them one on the way past.
 
 The key never leaves your process, and the package never writes it anywhere.
 
+### Using something else
+
+The algorithm is a seam. `cipher` sets what new writes use; `ciphers` lists
+what the vault can still read:
+
+```ts
+import { aesGcm } from "@mstone6969/vault"
+
+const vault = new Vault({ key, store, cipher: aesGcm(128) })
+```
+
+Values record which algorithm sealed them, so old and new coexist and
+`reseal()` is the migration — it rewrites each value under whatever the vault
+currently writes with. `ciphersInUse()` tells you how far that has got:
+
+```ts
+await vault.ciphersInUse()   // { A256GCM: 412 }
+await vault.reseal()
+await vault.ciphersInUse()   // { A128GCM: 412 }
+```
+
+Values sealed with the default carry no marker at all, so nothing already
+written changes shape and a vault that never touches this is byte-for-byte what
+it was.
+
+Implement `Cipher` to use an algorithm that does not ship here — a
+FIPS-validated module, ChaCha20-Poly1305 through `node:crypto` on Node, a
+post-quantum scheme. A cipher never sees the entry it belongs to and does not
+need to: the tie that stops a value being moved between entries is on the data
+key, not the value, so a plugged-in algorithm cannot weaken it by leaving
+something out.
+
+Two warnings worth heeding. Check the algorithm exists on your runtime before
+committing a vault to it — Bun has no `chacha20-poly1305`, and a vault that
+cannot open its own values is not recoverable. And nothing about AES-256 is
+known to be weak: if you have no specific reason to move, do not.
+
 ## Lifecycle
 
 An entry can be more than a value:
