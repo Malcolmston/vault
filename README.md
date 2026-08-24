@@ -318,27 +318,6 @@ publishes with the `NPM_TOKEN` repository secret.
 `workflow_dispatch` runs everything except the publish, for checking the
 pipeline without spending a version number.
 
-### The two registries
-
-The same release goes to both, under two names:
-
-| Registry | Name | Auth |
-| --- | --- | --- |
-| npmjs.com | `@mstone6969/vault` | `NPM_TOKEN` secret |
-| GitHub Packages | `@malcolmston/vault` | `GITHUB_TOKEN`, no secret needed |
-
-The names differ because GitHub Packages requires a package's scope to be the
-repository owner's, lowercased — `Malcolmston` here, not the npm account
-`mstone6969`. The code and version are identical; **npmjs.com is the one to
-depend on**, and the GitHub copy is there for anyone already authenticating to
-that registry.
-
-Installing from GitHub Packages needs an `.npmrc` pointing the scope at it:
-
-```
-@malcolmston:registry=https://npm.pkg.github.com
-```
-
 ## Development
 
 ```bash
