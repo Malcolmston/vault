@@ -10,7 +10,7 @@ import { MemoryStore } from "./stores/memory"
 import { Database } from "bun:sqlite"
 import { SqliteAuditLog, SqliteStore } from "./stores/sqlite"
 import type { AuditLog, SecretRecord, VaultEvent, VaultStore } from "./types"
-import { MemoryAuditLog } from "./audit"
+import { chainHash, MemoryAuditLog, verifyChain } from "./audit"
 import { randomValue, Vault } from "./vault"
 
 const KEY = generateKey()
@@ -142,9 +142,10 @@ test("each value has its own key, and only that key meets the master", async () 
     expect(a?.sealedKey).toBeTruthy()
     expect(a?.sealedKey).not.toBe(b?.sealedKey)
 
-    // The master opens the data key; the data key opens the value.
+    // The master opens the data key — but only as the entry it belongs to —
+    // and the data key opens the value.
     const master = await importKey(KEY)
-    const material = await open(master, a!.sealedKey!)
+    const material = await open(master, a!.sealedKey!, `${a!.owner}\u0000${a!.name}`)
     expect(await open(await importKey(material), a!.sealed)).toBe("first")
 
     // The master alone cannot open the value.
@@ -2034,4 +2035,212 @@ test("under strictWrites a grant cannot be lost to a value written beside it", a
         strict.put("alice", "db", "stale", { expectedRevision: 1 })
     ).rejects.toThrow(/has changed/)
     expect(await strict.open("bob", "db", { from: "alice" })).toBe("hunter2")
+})
+
+
+// --- values are tied to where they live -----------------------------------
+
+/** What a data key is sealed as belonging to, as the vault builds it. */
+function boundTo(owner: string, name: string): string {
+    return `${owner}\u0000${name}`
+}
+
+/** A record in the 1.3 shape: an envelope, but not tied to its entry. */
+async function unbound(name: string, value: string): Promise<SecretRecord> {
+    const material = generateKey()
+    return {
+        owner: "alice",
+        name,
+        sealed: await seal(await importKey(material), value),
+        sealedKey: await seal(await importKey(KEY), material),
+        plain: null,
+        isSealed: true,
+        isFinal: false,
+        expiresAt: null,
+        history: [],
+        rotation: null,
+        rotatedAt: null,
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+    }
+}
+
+test("sealed bytes moved to another entry will not open there", async () => {
+    await vault.put("alice", "payroll", "SECRET")
+    await vault.put("bob", "junk", "bob's own")
+
+    // Someone with write access to the store — a DBA, a compromised app, a
+    // backup restored badly — copies Alice's sealed bytes into Bob's row.
+    const alice = (await store.get("alice", "payroll"))!
+    const bob = (await store.get("bob", "junk"))!
+    await store.put({ ...bob, sealed: alice.sealed, sealedKey: alice.sealedKey })
+
+    await expect(vault.open("bob", "junk")).rejects.toThrow(VaultKeyError)
+    // Alice's own entry is untouched by any of it.
+    expect(await vault.open("alice", "payroll")).toBe("SECRET")
+})
+
+test("renaming an entry behind the vault's back breaks it rather than moving it", async () => {
+    await vault.put("alice", "old-name", "value")
+    const record = (await store.get("alice", "old-name"))!
+    await store.put({ ...record, name: "new-name" })
+
+    await expect(vault.open("alice", "new-name")).rejects.toThrow(VaultKeyError)
+})
+
+test("history cannot be moved between entries either", async () => {
+    await vault.put("alice", "db", "first")
+    await vault.rotate("alice", "db", "second")
+    await vault.put("bob", "db", "bob's")
+
+    const alice = (await store.get("alice", "db"))!
+    const bob = (await store.get("bob", "db"))!
+    await store.put({ ...bob, history: alice.history })
+
+    await expect(vault.versions("bob", "db")).rejects.toThrow(VaultKeyError)
+})
+
+test("an entry written before 1.4 still opens, and a rekey ties it down", async () => {
+    await store.put(await unbound("legacy", "from before"))
+    expect(await vault.open("alice", "legacy")).toBe("from before")
+
+    const next = generateKey()
+    const moved = new Vault({ key: next, store, previousKeys: [KEY] })
+    expect((await moved.rekey(next)).rekeyed).toBe(1)
+
+    // Tied down on the way past: the key no longer opens unbound.
+    const after = (await store.get("alice", "legacy"))!
+    await expect(open(await importKey(next), after.sealedKey!)).rejects.toThrow(VaultKeyError)
+    expect(
+        await open(await importKey(next), after.sealedKey!, boundTo("alice", "legacy"))
+    ).toBeTruthy()
+    expect(await moved.open("alice", "legacy")).toBe("from before")
+})
+
+test("a reseal ties down an entry written before 1.4 as well", async () => {
+    await store.put(await unbound("legacy", "from before"))
+
+    expect((await vault.reseal("alice")).rekeyed).toBe(1)
+
+    const after = (await store.get("alice", "legacy"))!
+    await expect(open(await importKey(KEY), after.sealedKey!)).rejects.toThrow(VaultKeyError)
+    expect(await vault.open("alice", "legacy")).toBe("from before")
+})
+
+test("an export still moves between vaults, bindings and all", async () => {
+    await vault.put("alice", "db", "first")
+    await vault.rotate("alice", "db", "second")
+
+    const carried = generateKey()
+    const document = await vault.exportAll(carried)
+
+    const elsewhere = new Vault({ key: generateKey(), store: new MemoryStore() })
+    await elsewhere.importAll(document, carried)
+
+    expect(await elsewhere.open("alice", "db")).toBe("second")
+    expect(await elsewhere.versions("alice", "db")).toEqual(["first"])
+})
+
+
+// --- the audit trail adds up ----------------------------------------------
+
+test("an untouched trail verifies, whichever log wrote it", async () => {
+    for (const log of [new MemoryAuditLog(), new SqliteAuditLog(":memory:")]) {
+        const watched = new Vault({ key: KEY, store: new MemoryStore(), audit: log })
+        await watched.put("alice", "db", "one")
+        await watched.rotate("alice", "db", "two")
+        await watched.open("alice", "db")
+
+        expect(await verifyChain(await log.entries())).toEqual({
+            intact: true,
+            brokenAt: null,
+            unchained: 0,
+        })
+    }
+})
+
+test("an edited line is caught", async () => {
+    const log = new MemoryAuditLog()
+    const watched = new Vault({ key: KEY, store, audit: log })
+
+    await watched.put("alice", "db", "one")
+    await watched.open("alice", "db")
+    await watched.put("alice", "other", "two")
+
+    // Somebody rewrites the middle of the trail to hide who read what.
+    const entries = await log.entries()
+    entries[1]!.owner = "mallory"
+
+    const report = await verifyChain(entries)
+    expect(report.intact).toBe(false)
+    expect(report.brokenAt).toBe(1)
+})
+
+test("a deleted line is caught, which hashing alone would not do", async () => {
+    const log = new SqliteAuditLog(":memory:")
+    const watched = new Vault({ key: KEY, store, audit: log })
+
+    await watched.put("alice", "db", "one")
+    await watched.open("alice", "db")
+    await watched.put("alice", "other", "two")
+
+    const entries = await log.entries()
+    // The read is removed entirely. Every remaining line still hashes
+    // correctly on its own; it is the link that gives it away.
+    entries.splice(1, 1)
+
+    expect((await verifyChain(entries)).intact).toBe(false)
+    log.close()
+})
+
+test("entries from before the chain are reported rather than failed", async () => {
+    const log = new MemoryAuditLog()
+    await log.append({ action: "put", owner: "alice", name: "db", at: new Date() })
+
+    const entries = await log.entries()
+    delete entries[0]!.hash
+
+    expect(await verifyChain(entries)).toEqual({
+        intact: true,
+        brokenAt: null,
+        unchained: 1,
+    })
+})
+
+test("two entries in the same millisecond still chain in order", async () => {
+    const log = new MemoryAuditLog()
+    const at = new Date()
+
+    await log.append({ action: "put", owner: "alice", name: "one", at })
+    await log.append({ action: "put", owner: "alice", name: "two", at })
+
+    expect((await verifyChain(await log.entries())).intact).toBe(true)
+})
+
+test("the hash covers every field that says what happened", async () => {
+    const at = new Date()
+    const base = { action: "open" as const, owner: "alice", name: "db", at }
+
+    const hashes = await Promise.all([
+        chainHash(base, null),
+        chainHash({ ...base, owner: "bob" }, null),
+        chainHash({ ...base, name: "other" }, null),
+        chainHash({ ...base, action: "read" }, null),
+        chainHash({ ...base, by: "carol" }, null),
+        chainHash({ ...base, detail: "final" }, null),
+        chainHash({ ...base, at: new Date(at.getTime() + 1) }, null),
+        chainHash(base, "a-different-previous"),
+    ])
+
+    expect(new Set(hashes).size).toBe(hashes.length)
+})
+
+test("fields cannot be shuffled between each other to forge a hash", async () => {
+    const at = new Date()
+    // Without length prefixes these two would flatten to the same string.
+    const one = await chainHash({ action: "open", owner: "ab", name: "c", at }, null)
+    const two = await chainHash({ action: "open", owner: "a", name: "bc", at }, null)
+
+    expect(one).not.toBe(two)
 })

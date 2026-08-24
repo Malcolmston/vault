@@ -186,6 +186,16 @@ AES-256-GCM, a fresh 12-byte IV per write, stored as `iv:payload` in base64.
 GCM's authentication tag means an altered value fails to open rather than
 decrypting to something wrong — both cases are covered by tests.
 
+Each entry's data key is sealed **as belonging to that entry**: its owner and
+name go into the authentication tag. Sealed bytes copied from one row to
+another therefore will not open in their new home, so somebody who can write to
+the database cannot hand themselves another owner's secret by moving it into
+their own row. It also means a backup restored across rows fails loudly instead
+of quietly serving the wrong credential.
+
+Entries written before 1.4 have no such tie and still open; `rekey` or `reseal`
+gives them one on the way past.
+
 The key never leaves your process, and the package never writes it anywhere.
 
 ## Lifecycle
@@ -416,6 +426,23 @@ Three logs ship: `MemoryAuditLog` for tests and development, `SqliteAuditLog`
 and `PostgresAuditLog` for a record that lasts. None of them has a method that
 deletes a line. Retention belongs to whoever owns the database, not to the
 library writing to it.
+
+Entries are hash-chained, so an edited or deleted line can be spotted:
+
+```ts
+import { verifyChain } from "@mstone6969/vault"
+
+const report = await verifyChain(await audit.entries())
+if (!report.intact) console.error("trail broken at", report.brokenAt)
+```
+
+Pass it an unfiltered listing — the chain runs through every entry, so a
+filtered slice looks broken when nothing is wrong. And be clear about what it
+buys: it proves the middle of a log has not been touched. It does not stop
+somebody who can write to the database from re-hashing the whole thing or
+lopping off the end. For that the log has to live somewhere the vault's writer
+cannot reach; `verifyChain` is then what tells you whether what came back from
+there adds up.
 
 ## More than one writer
 

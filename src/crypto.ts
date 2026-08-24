@@ -104,15 +104,35 @@ export async function importKey(base64Key: string): Promise<CryptoKey> {
  * sealed.split(":").length // 2
  * await open(key, sealed) // "s3cret"
  * ```
+ * @param binding What this ciphertext belongs to, mixed into the
+ *   authentication tag but not stored. A value sealed with one will not open
+ *   without exactly the same one, which is how the vault stops sealed bytes
+ *   being moved from one entry to another.
  */
-export async function seal(key: CryptoKey, plaintext: string): Promise<string> {
+export async function seal(
+    key: CryptoKey,
+    plaintext: string,
+    binding?: string
+): Promise<string> {
     const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES))
     const sealed = await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv },
+        { name: "AES-GCM", iv, ...additional(binding) },
         key,
         new TextEncoder().encode(plaintext)
     )
     return `${Buffer.from(iv).toString("base64")}:${Buffer.from(sealed).toString("base64")}`
+}
+
+/**
+ * The binding as GCM's additional authenticated data, or nothing.
+ *
+ * @param binding What the ciphertext is tied to, if anything.
+ * @returns An object to spread into the algorithm parameters.
+ */
+function additional(binding: string | undefined): { additionalData?: Uint8Array } {
+    return binding === undefined
+        ? {}
+        : { additionalData: new TextEncoder().encode(binding) }
 }
 
 /**
@@ -148,8 +168,14 @@ export async function seal(key: CryptoKey, plaintext: string): Promise<string> {
  *     error instanceof VaultKeyError // true — never a wrong plaintext
  * }
  * ```
+ * @param binding What the ciphertext was sealed as belonging to. Must match
+ *   what {@link seal} was given, or the value will not open.
  */
-export async function open(key: CryptoKey, sealed: string): Promise<string> {
+export async function open(
+    key: CryptoKey,
+    sealed: string,
+    binding?: string
+): Promise<string> {
     const [iv, payload] = sealed.split(":")
     if (!iv || !payload) {
         throw new VaultKeyError("A sealed value must look like iv:payload.")
@@ -157,14 +183,14 @@ export async function open(key: CryptoKey, sealed: string): Promise<string> {
 
     try {
         const opened = await crypto.subtle.decrypt(
-            { name: "AES-GCM", iv: Buffer.from(iv, "base64") },
+            { name: "AES-GCM", iv: Buffer.from(iv, "base64"), ...additional(binding) },
             key,
             Buffer.from(payload, "base64")
         )
         return new TextDecoder().decode(opened)
     } catch {
         throw new VaultKeyError(
-            "That value could not be opened — wrong key, or it has been altered."
+            "That value could not be opened — wrong key, wrong place, or it has been altered."
         )
     }
 }

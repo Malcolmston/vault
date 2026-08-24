@@ -4,7 +4,7 @@
  * fake. Skipped when there is nowhere to connect to.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
-import { generateKey, Vault } from "../index"
+import { generateKey, Vault, verifyChain } from "../index"
 import { PostgresAuditLog, PostgresStore } from "./postgres"
 
 const URL = process.env.VAULT_TEST_DATABASE_URL
@@ -206,6 +206,39 @@ describe.skipIf(!URL)("PostgresAuditLog", () => {
         expect(grant?.expiresAt?.getTime()).toBe(until.getTime())
         expect(grant?.grantedAt).toBeInstanceOf(Date)
         expect(await vault.open("bob", "db", { from: "alice" })).toBe("next")
+    })
+
+
+    test("its trail verifies, and a tampered one does not", async () => {
+        const vault = new Vault({ key: generateKey(), store, audit: log })
+        await vault.put("alice", "db", "one")
+        await vault.open("alice", "db")
+        await vault.put("alice", "two", "x")
+
+        const entries = await log.entries()
+        expect((await verifyChain(entries)).intact).toBe(true)
+
+        entries[1]!.detail = "rewritten"
+        expect((await verifyChain(entries)).intact).toBe(false)
+    })
+
+    test("appends from two connections at once do not fork the chain", async () => {
+        const one = new PostgresAuditLog(URL ?? "", AUDIT_TABLE)
+        const two = new PostgresAuditLog(URL ?? "", AUDIT_TABLE)
+        const at = new Date()
+
+        // Both read the tail and write; the transaction is what stops them
+        // both chaining to the same entry.
+        await Promise.all([
+            one.append({ action: "put", owner: "alice", name: "a", at }),
+            two.append({ action: "put", owner: "alice", name: "b", at }),
+            one.append({ action: "put", owner: "alice", name: "c", at }),
+            two.append({ action: "put", owner: "alice", name: "d", at }),
+        ])
+
+        expect((await verifyChain(await log.entries())).intact).toBe(true)
+        await one.close()
+        await two.close()
     })
 
     test("a client passed in is left open for whoever owns it", async () => {

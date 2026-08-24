@@ -31,6 +31,25 @@ way, so neither can be told from the other.
 - **Timing.** Nothing here is written to run in constant time.
 - **Metadata you choose to store.** It is deliberately in the clear. Do not put
   a secret in it.
+- **Someone who can delete.** Values tied to their entry cannot be moved or
+  swapped, and a thinned audit trail can be spotted — but nothing here stops a
+  writer with database access from deleting rows outright, or from re-hashing a
+  trail they can rewrite whole. Keep backups, and keep the audit log where the
+  vault's own writer cannot reach it.
+
+## Values are tied to where they live
+
+Since 1.4, each entry's data key is sealed with its owner and name as
+additional authenticated data. Ciphertext moved from one entry to another will
+not open in its new home.
+
+That matters because the per-owner scoping is otherwise only enforced by the
+code path: before 1.4, anyone who could write to the store could copy one
+owner's sealed bytes into a row they controlled and read them back. Now the
+cryptography enforces it too, and no key is needed to notice.
+
+Entries written before 1.4 are not tied down. They still open, and `rekey` or
+`reseal` migrates them. Until you run one, those entries have the old property.
 
 ## Choosing a key
 

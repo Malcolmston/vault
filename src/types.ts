@@ -567,7 +567,27 @@ export type VaultEvent = {
  *
  * @see {@link AuditLog}
  */
-export type AuditEntry = VaultEvent
+export type AuditEntry = VaultEvent & {
+    /**
+     * This entry's place in the chain: a hash over its own contents and the
+     * hash before it.
+     *
+     * @remarks
+     * Set by the log when it writes the entry, so the vault never supplies
+     * one. Absent on entries written before 1.4, and on logs that do not chain.
+     *
+     * @see {@link verifyChain}
+     */
+    hash?: string
+    /**
+     * The hash of the entry before this one, or null for the first.
+     *
+     * @remarks
+     * What makes a deletion detectable: remove a line and the next one points
+     * at something that is no longer there.
+     */
+    previous?: string | null
+}
 
 /**
  * Which entries of an audit trail to read back.

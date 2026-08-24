@@ -8,6 +8,51 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 1.4.0 — 2026-08-24
+
+Integrity. Two things that were trusted to the code path are now enforced by
+the cryptography.
+
+### Sealed values are tied to where they live
+
+Each entry's data key is sealed with its owner and name as additional
+authenticated data, so ciphertext copied from one row to another will not open
+in its new home.
+
+This closes a real hole rather than hardening a theoretical one. Before 1.4,
+anyone who could write to the store — a DBA, a compromised process, a backup
+restored across rows — could copy one owner's sealed bytes into a row they
+controlled and read the secret back, without needing any key. Per-owner scoping
+is the vault's main claim over an encrypted map, and it was enforced only by
+the code that read from the store. Now it is enforced by the tag.
+
+It also turns a bad restore from a silent wrong answer into a loud failure.
+
+Entries written before 1.4 have no tie and keep opening; `rekey` or `reseal`
+gives them one on the way past. Trying bound first and unbound second is not a
+way around it — a key sealed *with* a binding will not open without one, so
+only a genuinely old entry can take the fallback.
+
+### The audit trail is hash-chained
+
+Every entry carries a hash over its own contents and the hash before it, so an
+edited line or a deleted one can be spotted with the new `verifyChain`.
+`PostgresAuditLog` takes a transaction-scoped advisory lock while appending, so
+two processes writing at once cannot fork the chain.
+
+What it buys is worth being exact about: it proves the middle of a log has not
+been touched. It does not stop somebody who can rewrite the whole table from
+re-hashing it, or from lopping off the end. For that the log has to live where
+the vault's writer cannot reach, and `verifyChain` is what tells you whether
+what came back from there adds up.
+
+### Fixed
+
+- `remove` never awaited its audit write. The entry was a floating promise, so
+  the fail-closed guarantee 1.3 introduced did not apply to deletions, and the
+  line could be lost entirely if the process exited first. Every audit write is
+  awaited now.
+
 ## 1.3.0 — 2026-08-24
 
 Additive. Two things a vault behind an API needs and this one did not have:

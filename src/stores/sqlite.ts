@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite"
+import { chainHash } from "../audit"
 import type {
     AuditEntry,
     AuditLog,
@@ -37,6 +38,8 @@ type AuditRow = {
     by: string | null
     detail: string | null
     at: number
+    previous: string | null
+    hash: string | null
 }
 
 /** Columns added after 0.1.0, applied to tables that predate them. */
@@ -481,7 +484,9 @@ export class SqliteAuditLog implements AuditLog {
                 name TEXT,
                 by TEXT,
                 detail TEXT,
-                at INTEGER NOT NULL
+                at INTEGER NOT NULL,
+                previous TEXT,
+                hash TEXT
             )`
         )
         this.db.run(`CREATE INDEX IF NOT EXISTS ${this.table}_at ON ${this.table} (at)`)
@@ -494,10 +499,20 @@ export class SqliteAuditLog implements AuditLog {
      * @returns Nothing, once it is in the table.
      */
     async append(entry: AuditEntry): Promise<void> {
+        // Read the tail and write the new line as one step, so two appends
+        // cannot both chain to the same entry and fork the trail.
+        const previous =
+            this.db
+                .query<{ hash: string | null }, []>(
+                    `SELECT hash FROM ${this.table} ORDER BY id DESC LIMIT 1`
+                )
+                .get()?.hash ?? null
+        const hash = await chainHash(entry, previous)
+
         this.db
             .query(
-                `INSERT INTO ${this.table} (action, owner, name, by, detail, at)
-                 VALUES (?, ?, ?, ?, ?, ?)`
+                `INSERT INTO ${this.table} (action, owner, name, by, detail, at, previous, hash)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
             )
             .run(
                 entry.action,
@@ -505,7 +520,9 @@ export class SqliteAuditLog implements AuditLog {
                 entry.name,
                 entry.by ?? null,
                 entry.detail ?? null,
-                entry.at.getTime()
+                entry.at.getTime(),
+                previous,
+                hash
             )
     }
 
@@ -543,6 +560,10 @@ export class SqliteAuditLog implements AuditLog {
             }
             if (row.by !== null) entry.by = row.by
             if (row.detail !== null) entry.detail = row.detail
+            if (row.hash !== null) {
+                entry.hash = row.hash
+                entry.previous = row.previous
+            }
             return entry
         })
     }

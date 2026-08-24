@@ -1,4 +1,5 @@
 import { SQL } from "bun"
+import { chainHash } from "../audit"
 import type {
     AuditEntry,
     AuditLog,
@@ -429,7 +430,9 @@ export class PostgresAuditLog implements AuditLog {
                 name    TEXT,
                 by      TEXT,
                 detail  TEXT,
-                at      TIMESTAMPTZ NOT NULL
+                at      TIMESTAMPTZ NOT NULL,
+                previous TEXT,
+                hash    TEXT
             )
         `)
         await this.sql.unsafe(
@@ -444,11 +447,37 @@ export class PostgresAuditLog implements AuditLog {
      * @returns Nothing, once the database has it.
      */
     async append(entry: AuditEntry): Promise<void> {
-        await this.sql.unsafe(
-            `INSERT INTO "${this.table}" (action, owner, name, by, detail, at)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [entry.action, entry.owner, entry.name, entry.by ?? null, entry.detail ?? null, entry.at]
-        )
+        // In one transaction, with the tail row locked: two processes appending
+        // at the same moment must not both chain to the same entry, which would
+        // fork the trail and make an intact log look tampered with.
+        await this.sql.begin(async (tx) => {
+            // A lock on the tail row would not be enough: row locks do not stop
+            // another transaction reading that same tail and inserting beside
+            // it, and on an empty table they lock nothing at all. This takes a
+            // lock on the table's name instead, held until the transaction
+            // ends, so appends to this trail happen one at a time.
+            await tx.unsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, [this.table])
+
+            const tail = (await tx.unsafe(
+                `SELECT hash FROM "${this.table}" ORDER BY id DESC LIMIT 1`
+            )) as { hash: string | null }[]
+            const previous = tail[0]?.hash ?? null
+
+            await tx.unsafe(
+                `INSERT INTO "${this.table}" (action, owner, name, by, detail, at, previous, hash)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                [
+                    entry.action,
+                    entry.owner,
+                    entry.name,
+                    entry.by ?? null,
+                    entry.detail ?? null,
+                    entry.at,
+                    previous,
+                    await chainHash(entry, previous),
+                ]
+            )
+        })
     }
 
     /**
@@ -481,6 +510,8 @@ export class PostgresAuditLog implements AuditLog {
             by: string | null
             detail: string | null
             at: Date
+            previous: string | null
+            hash: string | null
         }[]
 
         return rows.map((row) => {
@@ -492,6 +523,10 @@ export class PostgresAuditLog implements AuditLog {
             }
             if (row.by !== null) entry.by = row.by
             if (row.detail !== null) entry.detail = row.detail
+            if (row.hash !== null) {
+                entry.hash = row.hash
+                entry.previous = row.previous
+            }
             return entry
         })
     }

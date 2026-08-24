@@ -480,13 +480,16 @@ export class Vault {
     }
 
     /** Opens something with the master key, falling back to retired ones. */
-    private async unsealWithMaster(sealed: string): Promise<string> {
+    private async unsealWithMaster(
+        sealed: string,
+        binding: string | undefined
+    ): Promise<string> {
         try {
-            return await open(await this.master(), sealed)
+            return await open(await this.master(), sealed, binding)
         } catch (error) {
             for (const previous of this.retired()) {
                 try {
-                    return await open(await previous, sealed)
+                    return await open(await previous, sealed, binding)
                 } catch {
                     // Not this one either; keep going.
                 }
@@ -496,23 +499,50 @@ export class Vault {
     }
 
     /** Opens a value: its data key first, then the value under that key. */
-    private async unseal(sealed: string, sealedKey: string | null): Promise<string> {
+    private async unseal(
+        sealed: string,
+        sealedKey: string | null,
+        binding: string
+    ): Promise<string> {
         if (!sealedKey) {
             // Written before envelope encryption: sealed under the master key.
-            return this.unsealWithMaster(sealed)
+            return this.unsealWithMaster(sealed, undefined)
         }
-        const dataKey = await importKey(await this.unsealWithMaster(sealedKey))
-        return open(dataKey, sealed)
+
+        return open(await importKey(await this.rewrap(sealedKey, binding)), sealed)
     }
 
     /** Seals a value under a fresh data key, and that key under the master. */
-    private async enseal(value: string): Promise<{ sealed: string; sealedKey: string }> {
+    private async enseal(
+        value: string,
+        binding: string
+    ): Promise<{ sealed: string; sealedKey: string }> {
         const material = generateKey()
         const dataKey = await importKey(material)
         return {
             sealed: await seal(dataKey, value),
-            sealedKey: await seal(await this.master(), material),
+            // The data key is what is tied to the entry. Binding it is enough:
+            // the value cannot be opened without its own key, so ciphertext
+            // moved to another entry is ciphertext nobody can unwrap.
+            sealedKey: await seal(await this.master(), material, binding),
         }
+    }
+
+    /**
+     * What an entry's data key is sealed as belonging to.
+     *
+     * @remarks
+     * Owner and name, separated by a byte that cannot occur in either — a name
+     * is checked against a character class that excludes it, and joining them
+     * any other way would let `("a/b", "c")` and `("a", "b/c")` produce the
+     * same binding.
+     *
+     * @param owner Whose entry it is.
+     * @param name What it is called.
+     * @returns The binding to seal and open its data key with.
+     */
+    private static binding(owner: string, name: string): string {
+        return `${owner}\u0000${name}`
     }
 
     private checkName(name: string): string {
@@ -642,7 +672,7 @@ export class Vault {
                 : (existing?.history ?? [])
 
         const body = isSealed
-            ? { ...(await this.enseal(value)), plain: null }
+            ? { ...(await this.enseal(value, Vault.binding(owner, clean))), plain: null }
             : { sealed: "", sealedKey: null, plain: value }
 
         const record = {
@@ -919,7 +949,9 @@ export class Vault {
     async versions(owner: string, name: string): Promise<string[]> {
         const record = await this.require(owner, name)
         return Promise.all(
-            record.history.map((entry) => this.unseal(entry.sealed, entry.sealedKey))
+            record.history.map((entry) =>
+                this.unseal(entry.sealed, entry.sealedKey, Vault.binding(owner, name))
+            )
         )
     }
 
@@ -977,7 +1009,7 @@ export class Vault {
         }
 
         const removed = await this.store.remove(owner, clean)
-        if (removed) this.record({ action: "remove", owner, name })
+        if (removed) await this.record({ action: "remove", owner, name })
         return removed
     }
 
@@ -1024,7 +1056,11 @@ export class Vault {
     async open(owner: string, name: string, { from }: Access = {}): Promise<string> {
         const record = await this.reach(owner, name, from)
         const value = record.isSealed
-            ? await this.unseal(record.sealed, record.sealedKey)
+            ? await this.unseal(
+                  record.sealed,
+                  record.sealedKey,
+                  Vault.binding(record.owner, record.name)
+              )
             : (record.plain ?? "")
 
         await this.record({ action: "open", owner: record.owner, name, by: from && owner })
@@ -1263,8 +1299,9 @@ export class Vault {
             if (!record.isSealed || !record.sealed) continue
 
             try {
-                const value = await this.unseal(record.sealed, record.sealedKey)
-                await this.store.put({ ...record, ...(await this.enseal(value)) })
+                const bound = Vault.binding(record.owner, record.name)
+                const value = await this.unseal(record.sealed, record.sealedKey, bound)
+                await this.store.put({ ...record, ...(await this.enseal(value, bound)) })
                 report.rekeyed += 1
             } catch {
                 // One unopenable value must not abort the run and leave the
@@ -1324,21 +1361,28 @@ export class Vault {
 
                 if (record.sealedKey) {
                     // Envelope: only the data key moves.
-                    const material = await this.unsealWithMaster(record.sealedKey)
+                    const bound = Vault.binding(record.owner, record.name)
+                    const material = await this.rewrap(record.sealedKey, bound)
                     await this.store.put({
                         ...record,
-                        sealedKey: await seal(nextKey, material),
+                        // Re-sealed bound, so a rekey is also what migrates an
+                        // entry written before 1.4 onto the tie.
+                        sealedKey: await seal(nextKey, material, bound),
                         history,
                     })
                 } else {
                     // Written before envelopes: give it one on the way past.
-                    const value = await this.unsealWithMaster(record.sealed)
+                    const value = await this.unsealWithMaster(record.sealed, undefined)
                     const material = generateKey()
                     const dataKey = await importKey(material)
                     await this.store.put({
                         ...record,
                         sealed: await seal(dataKey, value),
-                        sealedKey: await seal(nextKey, material),
+                        sealedKey: await seal(
+                            nextKey,
+                            material,
+                            Vault.binding(record.owner, record.name)
+                        ),
                         history,
                     })
                 }
@@ -1369,13 +1413,39 @@ export class Vault {
         record: SecretRecord,
         nextKey: CryptoKey
     ): Promise<SecretRecord["history"]> {
+        const binding = Vault.binding(record.owner, record.name)
         return Promise.all(
             record.history.map(async (entry) => {
                 if (!entry.sealedKey) return entry
-                const material = await this.unsealWithMaster(entry.sealedKey)
-                return { ...entry, sealedKey: await seal(nextKey, material) }
+                const material = await this.rewrap(entry.sealedKey, binding)
+                return { ...entry, sealedKey: await seal(nextKey, material, binding) }
             })
         )
+    }
+
+    /**
+     * Unwraps a data key that may or may not be tied to its entry yet.
+     *
+     * @remarks
+     * Bound first, unbound only if that fails. A key sealed *with* a binding
+     * will not open without one, so the fallback can only ever reach a key
+     * written before 1.4 — it is a migration path, not a way around the tie.
+     *
+     * @param sealedKey The wrapped data key.
+     * @param binding What it should belong to.
+     * @returns The data key material.
+     * @throws {@link VaultKeyError} when no key this vault holds opens it.
+     */
+    private async rewrap(sealedKey: string, binding: string): Promise<string> {
+        try {
+            return await this.unsealWithMaster(sealedKey, binding)
+        } catch (error) {
+            try {
+                return await this.unsealWithMaster(sealedKey, undefined)
+            } catch {
+                throw error
+            }
+        }
     }
 
     /**
@@ -1422,10 +1492,20 @@ export class Vault {
                 name: record.name,
                 // Opened here, so the far end can re-seal under its own key.
                 value: record.isSealed
-                    ? await this.unseal(record.sealed, record.sealedKey)
+                    ? await this.unseal(
+                          record.sealed,
+                          record.sealedKey,
+                          Vault.binding(record.owner, record.name)
+                      )
                     : (record.plain ?? ""),
                 history: await Promise.all(
-                    record.history.map((entry) => this.unseal(entry.sealed, entry.sealedKey))
+                    record.history.map((entry) =>
+                        this.unseal(
+                            entry.sealed,
+                            entry.sealedKey,
+                            Vault.binding(record.owner, record.name)
+                        )
+                    )
                 ),
                 isSealed: record.isSealed,
                 isFinal: record.isFinal,
@@ -1490,15 +1570,16 @@ export class Vault {
                 continue
             }
 
+            const bound = Vault.binding(entry.owner, entry.name)
             const body = entry.isSealed
-                ? { ...(await this.enseal(entry.value)), plain: null }
+                ? { ...(await this.enseal(entry.value, bound)), plain: null }
                 : { sealed: "", sealedKey: null, plain: entry.value }
 
             // History is re-sealed too, each value under a key of its own.
             const history = []
             for (const value of entry.history) {
                 history.push({
-                    ...(await this.enseal(value)),
+                    ...(await this.enseal(value, bound)),
                     createdAt: new Date(entry.updatedAt),
                 })
             }
