@@ -8,6 +8,42 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 1.5.0 — 2026-08-24
+
+Additive. The master key no longer has to exist in the process.
+
+### Added
+
+- **`KeyWrapper`**: an alternative to `KeyProvider` that never hands the vault
+  key material. It does the two operations the vault actually needs — wrap a
+  data key, unwrap it again — wherever the key lives: AWS KMS, Cloud KMS,
+  Vault's transit engine, an HSM. A `KeyProvider` puts the key in memory, where
+  a heap dump has it; a wrapper does not.
+
+  This only works cheaply because of the envelope introduced in 0.5.0: it is
+  the small data key that crosses the boundary, never the value, so it is one
+  short round trip per entry rather than sending secrets over the wire. There
+  is a test asserting that what reaches a wrapper is 32 bytes and not the
+  secret.
+
+  The `binding` from 1.4 is passed to the wrapper, so handing it to the service
+  as an encryption context makes the KMS enforce the same tie.
+
+- A wrapper is accepted anywhere a key is: as `key`, in `previousKeys`, and as
+  the argument to `rekey`. So moving an existing vault onto a KMS is
+  `rekey(wrapper)` rather than a migration, and moving back off is
+  `rekey(material)`. Both directions are tested.
+
+- `isKeyWrapper`, and `KeySource` for "anything the vault takes as a key".
+
+### Internal
+
+`Vault` no longer holds a `CryptoKey`. Everything above the key now goes
+through one small interface with `wrap` and `unwrap`, and a local key is just
+an implementation of it. That is why a KMS needed no new code paths anywhere
+else — and why `previousKeys` can hold a mix of local keys and wrappers while a
+rekey is half done.
+
 ## 1.4.0 — 2026-08-24
 
 Integrity. Two things that were trusted to the code path are now enforced by

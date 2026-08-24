@@ -4,7 +4,15 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { generateKey, importKey, open, seal } from "./crypto"
 import { VaultError, VaultKeyError } from "./errors"
-import { envKey, fileKey, isKeyProvider, passphraseKey, staticKey } from "./providers"
+import {
+    envKey,
+    fileKey,
+    isKeyProvider,
+    isKeyWrapper,
+    passphraseKey,
+    staticKey,
+    type KeyWrapper,
+} from "./providers"
 import { FileStore } from "./stores/file"
 import { MemoryStore } from "./stores/memory"
 import { Database } from "bun:sqlite"
@@ -2249,4 +2257,146 @@ test("fields cannot be shuffled between each other to forge a hash", async () =>
     const two = await chainHash({ action: "open", owner: "a", name: "bc", at }, null)
 
     expect(one).not.toBe(two)
+})
+
+
+// --- keys the process never holds -----------------------------------------
+
+/**
+ * Stands in for a KMS: it holds a key the vault is never given, and answers
+ * only wrap and unwrap. The encryption context is honoured, as a real one
+ * would, so a key wrapped for one entry will not unwrap as another.
+ */
+function fakeKms(material = generateKey()) {
+    const calls = { wrap: 0, unwrap: 0 }
+    const wrapper: KeyWrapper = {
+        async wrap(dataKey, binding) {
+            calls.wrap += 1
+            return seal(await importKey(material), dataKey, `kms:${binding}`)
+        },
+        async unwrap(wrapped, binding) {
+            calls.unwrap += 1
+            return open(await importKey(material), wrapped, `kms:${binding}`)
+        },
+    }
+    return { wrapper, calls }
+}
+
+test("a vault can run on a key it never sees", async () => {
+    const { wrapper, calls } = fakeKms()
+    const remote = new Vault({ key: wrapper, store })
+
+    await remote.put("alice", "db", "hunter2")
+    expect(await remote.open("alice", "db")).toBe("hunter2")
+
+    expect(calls.wrap).toBe(1)
+    expect(calls.unwrap).toBe(1)
+})
+
+test("a wrapper is asked about the data key, never about the value", async () => {
+    const seen: string[] = []
+    const material = generateKey()
+    const wrapper: KeyWrapper = {
+        async wrap(dataKey, binding) {
+            seen.push(dataKey)
+            return seal(await importKey(material), dataKey, binding)
+        },
+        async unwrap(wrapped, binding) {
+            return open(await importKey(material), wrapped, binding)
+        },
+    }
+
+    const remote = new Vault({ key: wrapper, store })
+    await remote.put("alice", "db", "a-very-secret-value")
+
+    // What crossed the boundary was a 32-byte key, not the secret.
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).not.toContain("a-very-secret-value")
+    expect(Buffer.from(seen[0]!, "base64")).toHaveLength(32)
+})
+
+test("the binding reaches the wrapper, so the service can enforce it too", async () => {
+    const bindings: string[] = []
+    const material = generateKey()
+    const wrapper: KeyWrapper = {
+        async wrap(dataKey, binding) {
+            bindings.push(binding)
+            return seal(await importKey(material), dataKey, binding)
+        },
+        async unwrap(wrapped, binding) {
+            return open(await importKey(material), wrapped, binding)
+        },
+    }
+
+    await new Vault({ key: wrapper, store }).put("alice", "db", "x")
+    expect(bindings).toEqual([`alice\u0000db`])
+})
+
+test("a wrapper that enforces the binding stops a value being moved", async () => {
+    const { wrapper } = fakeKms()
+    const remote = new Vault({ key: wrapper, store })
+
+    await remote.put("alice", "payroll", "SECRET")
+    await remote.put("bob", "junk", "bob's")
+
+    const alice = (await store.get("alice", "payroll"))!
+    const bob = (await store.get("bob", "junk"))!
+    await store.put({ ...bob, sealed: alice.sealed, sealedKey: alice.sealedKey })
+
+    await expect(remote.open("bob", "junk")).rejects.toThrow(VaultKeyError)
+})
+
+test("moving a vault onto a wrapper is a rekey, not a migration", async () => {
+    const local = new Vault({ key: KEY, store })
+    await local.put("alice", "db", "hunter2")
+    await local.rotate("alice", "db", "next")
+
+    const { wrapper, calls } = fakeKms()
+    expect((await local.rekey(wrapper)).failed).toEqual([])
+
+    // Read back through the wrapper, with the old key gone entirely.
+    const remote = new Vault({ key: wrapper, store })
+    expect(await remote.open("alice", "db")).toBe("next")
+    expect(await remote.versions("alice", "db")).toEqual(["hunter2"])
+    expect(calls.wrap).toBeGreaterThan(0)
+})
+
+test("and moving off one again works the same way", async () => {
+    const { wrapper } = fakeKms()
+    const remote = new Vault({ key: wrapper, store })
+    await remote.put("alice", "db", "hunter2")
+
+    const local = generateKey()
+    expect((await remote.rekey(local)).failed).toEqual([])
+    expect(await new Vault({ key: local, store }).open("alice", "db")).toBe("hunter2")
+})
+
+test("a retired wrapper keeps values readable while a rekey is half done", async () => {
+    const old = fakeKms()
+    const writing = new Vault({ key: old.wrapper, store })
+    await writing.put("alice", "db", "hunter2")
+
+    const fresh = fakeKms()
+    const both = new Vault({ key: fresh.wrapper, store, previousKeys: [old.wrapper] })
+    expect(await both.open("alice", "db")).toBe("hunter2")
+})
+
+test("a wrapper that refuses is reported like any other key that will not open", async () => {
+    const wrapper: KeyWrapper = {
+        wrap: async () => "not-really-wrapped",
+        unwrap: async () => {
+            throw new Error("the KMS said no")
+        },
+    }
+    const remote = new Vault({ key: wrapper, store })
+    await remote.put("alice", "db", "hunter2")
+
+    await expect(remote.open("alice", "db")).rejects.toThrow(/the KMS said no/)
+})
+
+test("isKeyWrapper tells a wrapper from a key or a provider", () => {
+    expect(isKeyWrapper({ wrap: () => {}, unwrap: () => {} })).toBe(true)
+    expect(isKeyWrapper({ key: () => "x" })).toBe(false)
+    expect(isKeyWrapper("base64-key")).toBe(false)
+    expect(isKeyWrapper(null)).toBe(false)
 })

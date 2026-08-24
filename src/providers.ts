@@ -212,6 +212,87 @@ export function passphraseKey(
 }
 
 /**
+ * Somewhere else that wraps and unwraps data keys, so the master key never
+ * reaches this process.
+ *
+ * @remarks
+ * A {@link KeyProvider} hands the vault key material, which means the key is in
+ * memory and a heap dump has it. A wrapper instead does the two operations the
+ * vault actually needs — wrap a data key, unwrap it again — somewhere the
+ * process cannot see: AWS KMS, Google Cloud KMS, HashiCorp Vault's transit
+ * engine, an HSM.
+ *
+ * This fits because of the envelope: only the small data key is ever wrapped,
+ * never the value, so it is one short round trip per entry rather than sending
+ * secrets over the wire. `rekey` becomes re-wrapping, and it is how you move a
+ * vault onto a KMS — read with the old key, write with the wrapper.
+ *
+ * A wrapper is accepted anywhere a key is: as `key`, in `previousKeys`, and as
+ * the argument to `rekey`.
+ *
+ * @example A wrapper over AWS KMS
+ * ```ts
+ * const wrapper: KeyWrapper = {
+ *     async wrap(material, binding) {
+ *         const out = await kms.send(new EncryptCommand({
+ *             KeyId: "alias/vault",
+ *             Plaintext: Buffer.from(material, "base64"),
+ *             EncryptionContext: { binding },
+ *         }))
+ *         return Buffer.from(out.CiphertextBlob!).toString("base64")
+ *     },
+ *     async unwrap(wrapped, binding) {
+ *         const out = await kms.send(new DecryptCommand({
+ *             CiphertextBlob: Buffer.from(wrapped, "base64"),
+ *             EncryptionContext: { binding },
+ *         }))
+ *         return Buffer.from(out.Plaintext!).toString("base64")
+ *     },
+ * }
+ *
+ * const vault = new Vault({ key: wrapper, store })
+ * ```
+ *
+ * @see {@link KeyProvider} for when the key may live in the process.
+ */
+export type KeyWrapper = {
+    /**
+     * Wraps a data key.
+     *
+     * @param material The data key, base64.
+     * @param binding What the key belongs to — pass it to the service as an
+     *   encryption context, so unwrapping it as anything else fails there too.
+     *   Empty for an entry written before 1.4, which has no binding.
+     * @returns The wrapped key, to be stored as-is.
+     */
+    wrap(material: string, binding: string): Promise<string>
+    /**
+     * Unwraps a data key.
+     *
+     * @param wrapped What {@link KeyWrapper.wrap} returned.
+     * @param binding The same binding it was wrapped with.
+     * @returns The data key, base64.
+     * @throws Whatever the service throws when it will not unwrap.
+     */
+    unwrap(wrapped: string, binding: string): Promise<string>
+}
+
+/**
+ * Whether something is a {@link KeyWrapper} rather than a key or a provider.
+ *
+ * @param value Anything.
+ * @returns True when it has both `wrap` and `unwrap`.
+ */
+export function isKeyWrapper(value: unknown): value is KeyWrapper {
+    return (
+        typeof value === "object" &&
+        value !== null &&
+        typeof (value as KeyWrapper).wrap === "function" &&
+        typeof (value as KeyWrapper).unwrap === "function"
+    )
+}
+
+/**
  * True when something is a provider rather than a key.
  *
  * {@link Vault} and {@link FileStore} accept either, and use this to tell them

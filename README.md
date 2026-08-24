@@ -299,9 +299,54 @@ comes out different and nothing opens. Keep it beside the vault.
 A passphrase is only ever as good as the passphrase. Prefer a generated key
 where you have somewhere to keep one.
 
-A provider is one method — write your own for a KMS or anything else. It is
-called the first time a key is actually needed, not when the vault is built, so
-a vault nobody uses never reaches for one.
+A provider is one method — write your own for anything that can hand over key
+material. It is called the first time a key is actually needed, not when the
+vault is built, so a vault nobody uses never reaches for one.
+
+### Or a key this process never sees
+
+A provider hands the vault key material, which means the key is in memory and a
+heap dump has it. A **`KeyWrapper`** instead does the two things the vault
+actually needs — wrap a data key, unwrap it again — somewhere the process
+cannot reach: AWS KMS, Cloud KMS, Vault's transit engine, an HSM.
+
+```ts
+const wrapper: KeyWrapper = {
+    async wrap(material, binding) {
+        const out = await kms.send(new EncryptCommand({
+            KeyId: "alias/vault",
+            Plaintext: Buffer.from(material, "base64"),
+            EncryptionContext: { binding },
+        }))
+        return Buffer.from(out.CiphertextBlob!).toString("base64")
+    },
+    async unwrap(wrapped, binding) {
+        const out = await kms.send(new DecryptCommand({
+            CiphertextBlob: Buffer.from(wrapped, "base64"),
+            EncryptionContext: { binding },
+        }))
+        return Buffer.from(out.Plaintext!).toString("base64")
+    },
+}
+
+const vault = new Vault({ key: wrapper, store })
+```
+
+This works because of the envelope: only the small data key is ever wrapped,
+never the value, so it is one short round trip per entry rather than sending
+secrets over the wire. The `binding` handed to a wrapper is the entry's owner
+and name, so passing it as the service's encryption context has the KMS enforce
+the same tie the local path enforces.
+
+A wrapper is accepted anywhere a key is — as `key`, in `previousKeys`, and as
+the argument to `rekey`. Which means moving an existing vault onto a KMS is not
+a migration:
+
+```ts
+await vault.rekey(wrapper)   // read with the old key, wrap with the KMS
+```
+
+and moving back off it is `rekey(material)`.
 
 ## Watching what happens
 

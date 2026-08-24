@@ -1,6 +1,12 @@
 import { generateKey, importKey, open, seal } from "./crypto"
 import { VaultError, VaultKeyError } from "./errors"
-import { isKeyProvider, staticKey, type KeyProvider } from "./providers"
+import {
+    isKeyProvider,
+    isKeyWrapper,
+    staticKey,
+    type KeyProvider,
+    type KeyWrapper,
+} from "./providers"
 import type {
     AuditLog,
     PutOptions,
@@ -170,8 +176,12 @@ export function randomValue(length = 32, alphabet = DEFAULT_ALPHABET): string {
  * ```
  */
 export type VaultOptions = {
-    /** The master key: base64, already imported, or a provider that finds one. */
-    key: string | CryptoKey | KeyProvider
+    /**
+     * What wraps this vault's data keys: base64 key material, an imported key,
+     * a {@link KeyProvider} that finds one, or a {@link KeyWrapper} that keeps
+     * the key somewhere this process cannot see it.
+     */
+    key: KeySource
     /** Where records are kept. */
     store: VaultStore
     /**
@@ -190,7 +200,7 @@ export type VaultOptions = {
      * @defaultValue none
      * @see {@link Vault.rekey}
      */
-    previousKeys?: (string | CryptoKey | KeyProvider)[]
+    previousKeys?: KeySource[]
     /**
      * How many previous values `rotate` keeps.
      *
@@ -313,11 +323,61 @@ export type RekeyReport = {
     failed: string[]
 }
 
+/** Anything the vault will take as the thing that wraps its data keys. */
+export type KeySource = string | CryptoKey | KeyProvider | KeyWrapper
+
 function toKey(key: string | CryptoKey | KeyProvider): Promise<CryptoKey> {
     const provider = isKeyProvider(key) ? key : staticKey(key)
     return Promise.resolve(provider.key()).then((resolved) =>
         typeof resolved === "string" ? importKey(resolved) : resolved
     )
+}
+
+/**
+ * What the vault actually asks of a key: wrap a data key, unwrap it again.
+ *
+ * @remarks
+ * The one place the difference between a key held here and a key held by a KMS
+ * lives. Everything above this works the same either way, which is why moving a
+ * vault onto a KMS is a `rekey` rather than a migration.
+ *
+ * `binding` is undefined only for entries written before 1.4, which have none.
+ */
+type Wrapper = {
+    wrap(material: string, binding: string | undefined): Promise<string>
+    unwrap(wrapped: string, binding: string | undefined): Promise<string>
+}
+
+/**
+ * Turns anything a caller may pass as a key into a {@link Wrapper}.
+ *
+ * @param source A key, a provider, or a wrapper.
+ * @returns Something that wraps and unwraps data keys.
+ */
+function toWrapper(source: KeySource): Wrapper {
+    if (isKeyWrapper(source)) {
+        return {
+            // A binding of "" rather than none: a service that takes an
+            // encryption context needs *something*, and empty says "unbound"
+            // consistently in both directions.
+            wrap: (material, binding) => source.wrap(material, binding ?? ""),
+            unwrap: (wrapped, binding) => source.unwrap(wrapped, binding ?? ""),
+        }
+    }
+
+    // Resolved once, on first use: a provider may be slow or may fail, and a
+    // vault nobody uses should do neither.
+    let key: Promise<CryptoKey> | null = null
+    const resolve = () => (key ??= toKey(source))
+
+    return {
+        async wrap(material, binding) {
+            return seal(await resolve(), material, binding)
+        },
+        async unwrap(wrapped, binding) {
+            return open(await resolve(), wrapped, binding)
+        },
+    }
 }
 
 function summarise(record: SecretRecord): SecretSummary {
@@ -376,12 +436,10 @@ function isExpired(record: SecretRecord, now: Date): boolean {
  *   where the records go, and {@link VaultError} for what it throws.
  */
 export class Vault {
-    private keySource: string | CryptoKey | KeyProvider
-    private previousSources: (string | CryptoKey | KeyProvider)[]
-    /** Resolved on first use, not at construction: a provider may need to wait,
-     * or fail, and a vault nobody uses should do neither. */
-    private keyCache: Promise<CryptoKey> | null = null
-    private previousCache: Promise<CryptoKey>[] | null = null
+    /** What wraps this vault's data keys, and what used to. Built at
+     * construction but not contacted until something needs a key. */
+    private current: Wrapper
+    private retiredWrappers: Wrapper[]
     private readonly store: VaultStore
     private readonly historyLimit: number
     private readonly generators: Record<string, Generator>
@@ -409,8 +467,8 @@ export class Vault {
         strictWrites = false,
         audit,
     }: VaultOptions) {
-        this.keySource = key
-        this.previousSources = previousKeys
+        this.current = toWrapper(key)
+        this.retiredWrappers = previousKeys.map(toWrapper)
         this.store = store
         this.prefix = prefix
         this.historyLimit = historyLimit
@@ -423,15 +481,7 @@ export class Vault {
         this.auditRequired = settings.required ?? true
     }
 
-    private master(): Promise<CryptoKey> {
-        this.keyCache ??= toKey(this.keySource)
-        return this.keyCache
-    }
 
-    private retired(): Promise<CryptoKey>[] {
-        this.previousCache ??= this.previousSources.map(toKey)
-        return this.previousCache
-    }
 
     /**
      * Reports one action to `onAccess` and, if there is one, writes it to the
@@ -485,11 +535,11 @@ export class Vault {
         binding: string | undefined
     ): Promise<string> {
         try {
-            return await open(await this.master(), sealed, binding)
+            return await this.current.unwrap(sealed, binding)
         } catch (error) {
-            for (const previous of this.retired()) {
+            for (const previous of this.retiredWrappers) {
                 try {
-                    return await open(await previous, sealed, binding)
+                    return await previous.unwrap(sealed, binding)
                 } catch {
                     // Not this one either; keep going.
                 }
@@ -524,7 +574,7 @@ export class Vault {
             // The data key is what is tied to the entry. Binding it is enough:
             // the value cannot be opened without its own key, so ciphertext
             // moved to another entry is ciphertext nobody can unwrap.
-            sealedKey: await seal(await this.master(), material, binding),
+            sealedKey: await this.current.wrap(material, binding),
         }
     }
 
@@ -1348,8 +1398,8 @@ export class Vault {
      *
      * @see {@link RekeyReport}, {@link VaultOptions.previousKeys}
      */
-    async rekey(next: string | CryptoKey | KeyProvider): Promise<RekeyReport> {
-        const nextKey = await toKey(next)
+    async rekey(next: KeySource): Promise<RekeyReport> {
+        const nextWrapper = toWrapper(next)
         const report: RekeyReport = { rekeyed: 0, failed: [] }
 
         for (const record of await this.store.all()) {
@@ -1357,7 +1407,7 @@ export class Vault {
             if (!record.isSealed) continue
 
             try {
-                const history = await this.rekeyHistory(record, nextKey)
+                const history = await this.rekeyHistory(record, nextWrapper)
 
                 if (record.sealedKey) {
                     // Envelope: only the data key moves.
@@ -1367,7 +1417,7 @@ export class Vault {
                         ...record,
                         // Re-sealed bound, so a rekey is also what migrates an
                         // entry written before 1.4 onto the tie.
-                        sealedKey: await seal(nextKey, material, bound),
+                        sealedKey: await nextWrapper.wrap(material, bound),
                         history,
                     })
                 } else {
@@ -1378,8 +1428,7 @@ export class Vault {
                     await this.store.put({
                         ...record,
                         sealed: await seal(dataKey, value),
-                        sealedKey: await seal(
-                            nextKey,
+                        sealedKey: await nextWrapper.wrap(
                             material,
                             Vault.binding(record.owner, record.name)
                         ),
@@ -1392,12 +1441,10 @@ export class Vault {
             }
         }
 
-        // Everything from here seals under the new key; the old one stays
+        // Everything from here wraps under the new key; the old one stays
         // readable in case a value was missed.
-        this.previousSources = [this.keySource, ...this.previousSources]
-        this.keySource = nextKey
-        this.keyCache = Promise.resolve(nextKey)
-        this.previousCache = null
+        this.retiredWrappers = [this.current, ...this.retiredWrappers]
+        this.current = nextWrapper
 
         await this.record({
             action: "rekey",
@@ -1411,14 +1458,14 @@ export class Vault {
     /** Moves an entry's kept values onto the new master key alongside it. */
     private async rekeyHistory(
         record: SecretRecord,
-        nextKey: CryptoKey
+        nextWrapper: Wrapper
     ): Promise<SecretRecord["history"]> {
         const binding = Vault.binding(record.owner, record.name)
         return Promise.all(
             record.history.map(async (entry) => {
                 if (!entry.sealedKey) return entry
                 const material = await this.rewrap(entry.sealedKey, binding)
-                return { ...entry, sealedKey: await seal(nextKey, material, binding) }
+                return { ...entry, sealedKey: await nextWrapper.wrap(material, binding) }
             })
         )
     }
