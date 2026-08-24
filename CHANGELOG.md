@@ -8,6 +8,49 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 1.3.0 — 2026-08-24
+
+Additive. Two things a vault behind an API needs and this one did not have:
+letting somebody else read a secret, and being able to say afterwards who did.
+
+### Sharing
+
+- `share(owner, name, { with, expiresAt })` lets another owner read one entry,
+  `unshare` withdraws it, `shares` says who can read one of yours, and
+  `sharedWith` says what you can read of other people's.
+- Grants are **read-only, always**. Writing, rotating and deleting stay with the
+  owner however widely an entry is shared — a grant that could overwrite the
+  credential would make "shared with" mean "owned by".
+- A reader names the owner: `open("bob", "token", { from: "alice" })`. That is
+  deliberately explicit, so a grant can never quietly shadow something the
+  reader already keeps under the same name.
+- References reach shared secrets as `@vault:alice/token`. A name cannot
+  contain a slash, so the two forms never collide.
+- `shares` reports lapsed grants and `sharedWith` does not: one answers "who
+  could have seen this", the other "what can I open".
+- Grants survive a replacing write, and go through the same guarded path as any
+  other change, so a grant and a value written at the same moment cannot lose
+  each other.
+
+### A stored audit trail
+
+- `VaultOptions.audit` takes an `AuditLog` and every action is written to it —
+  including the refusals, which are usually the ones worth having. A read
+  through a grant records both sides: `owner` is whose secret it was, `by` is
+  who read it.
+- **A log that cannot be written fails the operation, by default.** An audit
+  trail with silent gaps is worse than none, because it looks like evidence.
+  `{ log, required: false }` makes it best-effort instead.
+- `MemoryAuditLog` ships in the main entry; `SqliteAuditLog` and
+  `PostgresAuditLog` ship beside their stores. None has a method that deletes a
+  line — retention belongs to whoever owns the database.
+- `onAccess` is unchanged and still fire-and-forget. Both can be set.
+
+One caveat worth knowing: the entry is written after the action and before the
+call returns, so a failed append reports something that did in fact happen.
+That is the cost of recording outcomes rather than intentions, and it fails in
+the safe direction — the caller is told something went wrong.
+
 ## 1.2.0 — 2026-08-24
 
 Additive. The release that makes the vault safe to run from more than one

@@ -331,6 +331,92 @@ and named in `failed` — re-sealing what cannot be read would only destroy it.
 > Losing every key loses every value sealed under them. Rekey before you retire
 > a key, and back the current one up where you would back up a password.
 
+## Sharing
+
+An entry belongs to one owner. To let somebody else read it, grant it:
+
+```ts
+await vault.share("alice", "deploy-key", { with: "bob" })
+
+await vault.open("bob", "deploy-key", { from: "alice" })
+```
+
+The reader names whose entry they want. That is deliberate — a grant can never
+quietly shadow something the reader already keeps under the same name, and
+`open("bob", "deploy-key")` still means Bob's own.
+
+Grants are **read-only, always**. Writing, rotating and deleting stay with the
+owner however widely an entry is shared; a grant that could overwrite the
+credential would make "shared with" mean "owned by". They can be temporary:
+
+```ts
+await vault.share("alice", "db", { with: "carol", expiresAt: friday })
+```
+
+`shares(owner, name)` says who can read one of yours — lapsed grants included,
+because "who could have seen this" is the question it exists to answer.
+`sharedWith(reader)` is the other direction, and leaves lapsed grants out
+because it answers what you can open right now.
+
+Withdrawing takes effect immediately:
+
+```ts
+await vault.unshare("alice", "deploy-key", { with: "bob" })
+```
+
+It says nothing about what Bob already read and kept, which is why a withdrawn
+grant is also a reason to rotate the value.
+
+References reach shared secrets by naming the owner, and a name cannot contain
+a slash, so the two forms never collide:
+
+```ts
+await vault.resolve("bob", {
+    OURS: "@vault:own-token",
+    THEIRS: "@vault:alice/db",
+})
+```
+
+## Keeping a record
+
+`onAccess` is a callback the vault does not wait for. For a trail that outlives
+the process, give it a log:
+
+```ts
+import { Vault } from "@mstone6969/vault"
+import { SqliteAuditLog } from "@mstone6969/vault/stores/sqlite"
+
+const audit = new SqliteAuditLog("./audit.sqlite")
+const vault = new Vault({ key, store, audit })
+
+await vault.open("alice", "db")
+
+// Read the trail from the log, not from the vault.
+await audit.entries({ owner: "alice", action: "open", since: monday })
+```
+
+Every action is recorded, including the refusals — usually the interesting
+ones. A read through a grant records both sides: `owner` is whose secret it
+was, `by` is who read it.
+
+**A log that cannot be written fails the operation.** That is the default and
+it is deliberate: an audit trail with silent gaps is worse than none, because
+it looks like evidence. If you would rather the vault carry on:
+
+```ts
+new Vault({ key, store, audit: { log, required: false } })
+```
+
+The entry is written after the action and before the call returns, so a failed
+append reports something that did in fact happen. That is the cost of recording
+outcomes rather than intentions, and it fails in the safe direction — the
+caller is told something went wrong.
+
+Three logs ship: `MemoryAuditLog` for tests and development, `SqliteAuditLog`
+and `PostgresAuditLog` for a record that lasts. None of them has a method that
+deletes a line. Retention belongs to whoever owns the database, not to the
+library writing to it.
+
 ## More than one writer
 
 Every entry carries a `revision` that goes up by one on each write. Read it,

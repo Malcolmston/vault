@@ -62,6 +62,15 @@ for (const tally of tallies) {
 if (short.length > 0) {
     console.error(`\nCoverage is below ${REQUIRED}%:`)
     console.error(short.join("\n"))
+
+    // The likeliest cause by far, and not obvious from the numbers alone.
+    if (short.some((line) => line.includes("postgres")) && !process.env.VAULT_TEST_DATABASE_URL) {
+        console.error(
+            "\nThe PostgreSQL tests were skipped because VAULT_TEST_DATABASE_URL is not set,\n" +
+                "so nothing exercised those files. Point it at a database and run this again:\n" +
+                "  VAULT_TEST_DATABASE_URL=postgres://user@localhost:5432/vault_test bun run test:coverage"
+        )
+    }
     process.exit(1)
 }
 

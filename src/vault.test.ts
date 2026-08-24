@@ -7,8 +7,10 @@ import { VaultError, VaultKeyError } from "./errors"
 import { envKey, fileKey, isKeyProvider, passphraseKey, staticKey } from "./providers"
 import { FileStore } from "./stores/file"
 import { MemoryStore } from "./stores/memory"
-import { SqliteStore } from "./stores/sqlite"
-import type { SecretRecord, VaultEvent, VaultStore } from "./types"
+import { Database } from "bun:sqlite"
+import { SqliteAuditLog, SqliteStore } from "./stores/sqlite"
+import type { AuditLog, SecretRecord, VaultEvent, VaultStore } from "./types"
+import { MemoryAuditLog } from "./audit"
 import { randomValue, Vault } from "./vault"
 
 const KEY = generateKey()
@@ -1664,4 +1666,372 @@ test("letting go of a lock that is already gone is not an error", async () => {
     release()
 
     await expect(writing).resolves.toBeDefined()
+})
+
+// --- sharing --------------------------------------------------------------
+
+test("a shared entry can be opened by the owner it was shared with", async () => {
+    await vault.put("alice", "deploy", "hunter2")
+    await vault.share("alice", "deploy", { with: "bob" })
+
+    expect(await vault.open("bob", "deploy", { from: "alice" })).toBe("hunter2")
+    // And still by its owner, the ordinary way.
+    expect(await vault.open("alice", "deploy")).toBe("hunter2")
+})
+
+test("an entry nobody shared is refused, and says whose it is", async () => {
+    await vault.put("alice", "deploy", "hunter2")
+
+    await expect(vault.open("bob", "deploy", { from: "alice" })).rejects.toThrow(
+        /belongs to alice and is not shared with bob/
+    )
+})
+
+test("a grant is read-only: it does not let the reader write", async () => {
+    await vault.put("alice", "deploy", "hunter2")
+    await vault.share("alice", "deploy", { with: "bob" })
+
+    // Bob writing "deploy" makes his own, and leaves Alice's alone.
+    await vault.put("bob", "deploy", "bob's own")
+    expect(await vault.open("alice", "deploy")).toBe("hunter2")
+    expect(await vault.open("bob", "deploy")).toBe("bob's own")
+    // Which is exactly why a reader has to name the owner.
+    expect(await vault.open("bob", "deploy", { from: "alice" })).toBe("hunter2")
+})
+
+test("a grant can be given an expiry, after which it refuses", async () => {
+    await vault.put("alice", "db", "hunter2")
+    await vault.share("alice", "db", { with: "bob", expiresAt: new Date(Date.now() - 1) })
+
+    await expect(vault.open("bob", "db", { from: "alice" })).rejects.toThrow(/not shared/)
+})
+
+test("sharing again replaces the grant rather than stacking another", async () => {
+    await vault.put("alice", "db", "hunter2")
+    await vault.share("alice", "db", { with: "bob", expiresAt: new Date(Date.now() - 1) })
+    await vault.share("alice", "db", { with: "bob" })
+
+    expect(await vault.shares("alice", "db")).toHaveLength(1)
+    expect(await vault.open("bob", "db", { from: "alice" })).toBe("hunter2")
+})
+
+test("withdrawing a grant takes effect at once", async () => {
+    await vault.put("alice", "db", "hunter2")
+    await vault.share("alice", "db", { with: "bob" })
+
+    expect(await vault.unshare("alice", "db", { with: "bob" })).toBe(true)
+    await expect(vault.open("bob", "db", { from: "alice" })).rejects.toThrow(/not shared/)
+
+    // Withdrawing one that was never there says so.
+    expect(await vault.unshare("alice", "db", { with: "carol" })).toBe(false)
+})
+
+test("rotating a shared entry keeps it shared", async () => {
+    await vault.put("alice", "db", "first")
+    await vault.share("alice", "db", { with: "bob" })
+    await vault.rotate("alice", "db", "second")
+
+    expect(await vault.open("bob", "db", { from: "alice" })).toBe("second")
+})
+
+test("nobody can share with themselves, or with nobody", async () => {
+    await vault.put("alice", "db", "hunter2")
+
+    await expect(vault.share("alice", "db", { with: "alice" })).rejects.toThrow(/already owns/)
+    await expect(vault.share("alice", "db", { with: "" })).rejects.toThrow(/somebody/)
+})
+
+test("shares lists who has access, lapsed grants included", async () => {
+    const lapsed = new Date(Date.now() - 1)
+    await vault.put("alice", "db", "hunter2")
+    await vault.share("alice", "db", { with: "bob" })
+    await vault.share("alice", "db", { with: "carol", expiresAt: lapsed })
+
+    const listed = await vault.shares("alice", "db")
+    expect(listed.map((share) => share.with).sort()).toEqual(["bob", "carol"])
+    // Kept, because who once had access is the question this answers.
+    expect(listed.find((share) => share.with === "carol")?.expiresAt).toEqual(lapsed)
+})
+
+test("sharedWith says what a reader can open, and leaves lapsed grants out", async () => {
+    await vault.put("alice", "db", "one")
+    await vault.put("alice", "api", "two")
+    await vault.put("carol", "key", "three")
+    await vault.put("bob", "own", "four")
+
+    await vault.share("alice", "db", { with: "bob" })
+    await vault.share("alice", "api", { with: "bob", expiresAt: new Date(Date.now() - 1) })
+    await vault.share("carol", "key", { with: "bob" })
+
+    const shared = await vault.sharedWith("bob")
+    expect(shared.map((entry) => `${entry.owner}/${entry.name}`)).toEqual([
+        "alice/db",
+        "carol/key",
+    ])
+
+    for (const entry of shared) {
+        expect(await vault.open("bob", entry.name, { from: entry.owner })).toBeDefined()
+    }
+})
+
+test("an expired entry is not reachable through a grant either", async () => {
+    await vault.put("alice", "db", "hunter2", { expiresAt: new Date(Date.now() - 1) })
+    // Sharing it is refused for the same reason reading it is.
+    await expect(vault.share("alice", "db", { with: "bob" })).rejects.toThrow(/expired/)
+})
+
+test("an entry in the open can be shared and read", async () => {
+    await vault.put("alice", "region", "eu-west-1", { sealed: false })
+    await vault.share("alice", "region", { with: "bob" })
+
+    expect(await vault.read("bob", "region", { from: "alice" })).toBe("eu-west-1")
+})
+
+test("a sealed entry shared with someone still refuses read", async () => {
+    await vault.put("alice", "db", "hunter2")
+    await vault.share("alice", "db", { with: "bob" })
+
+    await expect(vault.read("bob", "db", { from: "alice" })).rejects.toThrow(/sealed/)
+})
+
+test("naming yourself as the owner is just an ordinary read", async () => {
+    await vault.put("alice", "db", "hunter2")
+    expect(await vault.open("alice", "db", { from: "alice" })).toBe("hunter2")
+})
+
+test("a reference can name a secret somebody shared", async () => {
+    await vault.put("alice", "db", "hunter2")
+    await vault.share("alice", "db", { with: "bob" })
+    await vault.put("bob", "own", "mine")
+
+    expect(
+        await vault.resolve("bob", { SHARED: "@vault:alice/db", OWN: "@vault:own" })
+    ).toEqual({ SHARED: "hunter2", OWN: "mine" })
+})
+
+test("a reference to something unshared is refused like any other", async () => {
+    await vault.put("alice", "db", "hunter2")
+
+    await expect(vault.resolve("bob", { V: "@vault:alice/db" })).rejects.toThrow(/not shared/)
+})
+
+// --- the audit log --------------------------------------------------------
+
+test("a stored audit log records what happened, refusals included", async () => {
+    const audit = new MemoryAuditLog()
+    const watched = new Vault({ key: KEY, store, audit })
+
+    await watched.put("alice", "db", "hunter2")
+    await watched.open("alice", "db")
+    await expect(watched.read("alice", "db")).rejects.toThrow(/sealed/)
+    await watched.remove("alice", "db")
+
+    expect((await audit.entries()).map((entry) => entry.action)).toEqual([
+        "remove",
+        "denied",
+        "open",
+        "put",
+    ])
+})
+
+test("an audit trail can be asked about one secret, or one kind of action", async () => {
+    const audit = new MemoryAuditLog()
+    const watched = new Vault({ key: KEY, store, audit })
+
+    await watched.put("alice", "one", "x")
+    await watched.put("alice", "two", "y")
+    await watched.open("alice", "one")
+
+    expect(await audit.entries({ name: "one" })).toHaveLength(2)
+    expect(await audit.entries({ action: "open" })).toHaveLength(1)
+    expect(await audit.entries({ owner: "bob" })).toHaveLength(0)
+    expect(await audit.entries({ limit: 1 })).toHaveLength(1)
+})
+
+test("an audit trail can be narrowed to a stretch of time", async () => {
+    const audit = new MemoryAuditLog()
+    const watched = new Vault({ key: KEY, store, audit })
+
+    const before = new Date()
+    await watched.put("alice", "one", "x")
+    await Bun.sleep(5)
+    const between = new Date()
+    await watched.put("alice", "two", "y")
+
+    expect(await audit.entries({ since: between })).toHaveLength(1)
+    expect(await audit.entries({ until: between })).toHaveLength(1)
+    // `until` is exclusive, so a bound of exactly "now" would drop anything
+    // that happened in this same millisecond.
+    const after = new Date(Date.now() + 1_000)
+    expect(await audit.entries({ since: before, until: after })).toHaveLength(2)
+})
+
+test("a grant used is recorded as who read whose", async () => {
+    const audit = new MemoryAuditLog()
+    const watched = new Vault({ key: KEY, store, audit })
+
+    await watched.put("alice", "db", "hunter2")
+    await watched.share("alice", "db", { with: "bob" })
+    await watched.open("bob", "db", { from: "alice" })
+
+    const [read, shared] = await audit.entries({ owner: "alice" })
+    expect(read).toMatchObject({ action: "open", owner: "alice", by: "bob" })
+    expect(shared).toMatchObject({ action: "share", owner: "alice", detail: "bob" })
+})
+
+test("an audit log that will not take an entry stops the operation", async () => {
+    const broken: AuditLog = {
+        append: async () => {
+            throw new Error("the disk is full")
+        },
+        entries: async () => [],
+    }
+    const watched = new Vault({ key: KEY, store, audit: broken })
+
+    await expect(watched.put("alice", "db", "hunter2")).rejects.toThrow(
+        /would not take this put.*the disk is full/
+    )
+})
+
+test("a best-effort audit log does not stop anything", async () => {
+    const broken: AuditLog = {
+        append: async () => {
+            throw new Error("the disk is full")
+        },
+        entries: async () => [],
+    }
+    const watched = new Vault({ key: KEY, store, audit: { log: broken, required: false } })
+
+    await expect(watched.put("alice", "db", "hunter2")).resolves.toBeDefined()
+    expect(await watched.open("alice", "db")).toBe("hunter2")
+})
+
+test("a memory audit log drops the oldest once it is full", async () => {
+    const audit = new MemoryAuditLog(2)
+    const watched = new Vault({ key: KEY, store, audit })
+
+    await watched.put("alice", "one", "x")
+    await watched.put("alice", "two", "y")
+    await watched.put("alice", "three", "z")
+
+    expect((await audit.entries()).map((entry) => entry.name)).toEqual(["three", "two"])
+})
+
+test("what an audit log hands back cannot be edited into history", async () => {
+    const audit = new MemoryAuditLog()
+    await audit.append({ action: "put", owner: "alice", name: "db", at: new Date() })
+
+    const [entry] = await audit.entries()
+    entry!.owner = "mallory"
+
+    expect((await audit.entries())[0]?.owner).toBe("alice")
+})
+
+test("onAccess and a stored log can both be set, and a throwing callback is ignored", async () => {
+    const audit = new MemoryAuditLog()
+    const watched = new Vault({
+        key: KEY,
+        store,
+        audit,
+        onAccess: () => {
+            throw new Error("the logger is broken")
+        },
+    })
+
+    await expect(watched.put("alice", "db", "hunter2")).resolves.toBeDefined()
+    expect(await audit.entries()).toHaveLength(1)
+})
+
+test("a SQLite audit log keeps what happened across everything asked of it", async () => {
+    const log = new SqliteAuditLog(":memory:")
+    const watched = new Vault({ key: KEY, store, audit: log })
+
+    await watched.put("alice", "db", "hunter2")
+    await watched.share("alice", "db", { with: "bob" })
+    await watched.open("bob", "db", { from: "alice" })
+    await watched.put("carol", "other", "x")
+
+    expect((await log.entries()).map((entry) => entry.action)).toEqual([
+        "put",
+        "open",
+        "share",
+        "put",
+    ])
+
+    const [read] = await log.entries({ action: "open" })
+    expect(read).toMatchObject({ owner: "alice", name: "db", by: "bob" })
+    expect(read?.at).toBeInstanceOf(Date)
+
+    expect(await log.entries({ owner: "carol" })).toHaveLength(1)
+    expect(await log.entries({ name: "db" })).toHaveLength(3)
+    expect(await log.entries({ limit: 2 })).toHaveLength(2)
+    expect(await log.entries({ since: new Date(Date.now() + 1_000) })).toHaveLength(0)
+    expect(await log.entries({ until: new Date(Date.now() + 1_000) })).toHaveLength(4)
+    log.close()
+})
+
+test("a SQLite audit log can share a database with the store", async () => {
+    const database = new Database(":memory:")
+    const shared = new SqliteStore(database)
+    const log = new SqliteAuditLog(database)
+    const watched = new Vault({ key: KEY, store: shared, audit: log })
+
+    await watched.put("alice", "db", "hunter2")
+    expect(await log.entries()).toHaveLength(1)
+    expect(await watched.open("alice", "db")).toBe("hunter2")
+    log.close()
+})
+
+test("SqliteStore keeps grants across a write and a reopen", async () => {
+    const file = path.join(dir, "shares.sqlite")
+    const first = new SqliteStore(file)
+    const writing = new Vault({ key: KEY, store: first })
+
+    await writing.put("alice", "db", "hunter2")
+    await writing.share("alice", "db", { with: "bob", expiresAt: new Date(Date.now() + 60_000) })
+    await writing.rotate("alice", "db", "next")
+    first.close()
+
+    const second = new SqliteStore(file)
+    const reading = new Vault({ key: KEY, store: second })
+    const [grant] = await reading.shares("alice", "db")
+
+    expect(grant?.with).toBe("bob")
+    expect(grant?.expiresAt).toBeInstanceOf(Date)
+    expect(grant?.grantedAt).toBeInstanceOf(Date)
+    expect(await reading.open("bob", "db", { from: "alice" })).toBe("next")
+    second.close()
+})
+
+test("FileStore keeps grants too", async () => {
+    const file = new FileStore(path.join(dir, "shares.vault"), KEY)
+    const writing = new Vault({ key: KEY, store: file })
+
+    await writing.put("alice", "db", "hunter2")
+    await writing.share("alice", "db", { with: "bob" })
+
+    file.forget()
+    expect(await writing.open("bob", "db", { from: "alice" })).toBe("hunter2")
+})
+
+test("a grant is a change to the entry, so it advances the revision", async () => {
+    const first = await vault.put("alice", "db", "hunter2")
+    expect(first.revision).toBe(1)
+
+    expect((await vault.share("alice", "db", { with: "bob" })).revision).toBe(2)
+    await vault.unshare("alice", "db", { with: "bob" })
+    expect((await vault.list("alice"))[0]?.revision).toBe(3)
+})
+
+test("under strictWrites a grant cannot be lost to a value written beside it", async () => {
+    const strict = new Vault({ key: KEY, store, strictWrites: true })
+    await strict.put("alice", "db", "hunter2")
+    await strict.share("alice", "db", { with: "bob" })
+
+    // A writer holding the pre-grant revision is refused rather than
+    // overwriting the record the grant lives on.
+    await expect(
+        strict.put("alice", "db", "stale", { expectedRevision: 1 })
+    ).rejects.toThrow(/has changed/)
+    expect(await strict.open("bob", "db", { from: "alice" })).toBe("hunter2")
 })

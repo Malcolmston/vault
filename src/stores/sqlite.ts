@@ -1,5 +1,13 @@
 import { Database } from "bun:sqlite"
-import type { HistoryEntry, SecretRecord, VaultStore } from "../types"
+import type {
+    AuditEntry,
+    AuditLog,
+    AuditQuery,
+    HistoryEntry,
+    SecretRecord,
+    Share,
+    VaultStore,
+} from "../types"
 
 type Row = {
     owner: string
@@ -17,6 +25,18 @@ type Row = {
     created_at: number
     updated_at: number
     revision: number | null
+    shares: string | null
+}
+
+/** One row of a {@link SqliteAuditLog} table. */
+type AuditRow = {
+    id: number
+    action: string
+    owner: string
+    name: string | null
+    by: string | null
+    detail: string | null
+    at: number
 }
 
 /** Columns added after 0.1.0, applied to tables that predate them. */
@@ -31,6 +51,7 @@ const LATER_COLUMNS: [string, string][] = [
     ["rotated_at", "INTEGER"],
     ["metadata", "TEXT"],
     ["revision", "INTEGER NOT NULL DEFAULT 1"],
+    ["shares", "TEXT"],
 ]
 
 /**
@@ -167,6 +188,13 @@ export class SqliteStore implements VaultStore {
             createdAt: new Date(row.created_at),
             updatedAt: new Date(row.updated_at),
             revision: row.revision ?? 1,
+            shares: row.shares
+                ? (JSON.parse(row.shares) as Share[]).map((share) => ({
+                      ...share,
+                      expiresAt: share.expiresAt === null ? null : new Date(share.expiresAt),
+                      grantedAt: new Date(share.grantedAt),
+                  }))
+                : [],
         }
     }
 
@@ -241,8 +269,8 @@ export class SqliteStore implements VaultStore {
                 `INSERT INTO ${this.table}
                     (owner, name, sealed, sealed_key, plain, is_sealed, is_final,
                      expires_at, history, rotation, rotated_at, metadata,
-                     created_at, updated_at, revision)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     created_at, updated_at, revision, shares)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(owner, name) DO UPDATE SET
                     sealed = excluded.sealed,
                     sealed_key = excluded.sealed_key,
@@ -255,7 +283,8 @@ export class SqliteStore implements VaultStore {
                     rotated_at = excluded.rotated_at,
                     metadata = excluded.metadata,
                     updated_at = excluded.updated_at,
-                    revision = excluded.revision`
+                    revision = excluded.revision,
+                    shares = excluded.shares`
             )
             .run(
                 record.owner,
@@ -272,7 +301,8 @@ export class SqliteStore implements VaultStore {
                 JSON.stringify(record.metadata),
                 record.createdAt.getTime(),
                 record.updatedAt.getTime(),
-                record.revision ?? 1
+                record.revision ?? 1,
+                JSON.stringify(record.shares ?? [])
             )
 
         const stored = await this.get(record.owner, record.name)
@@ -314,8 +344,8 @@ export class SqliteStore implements VaultStore {
                 `INSERT OR IGNORE INTO ${this.table}
                     (owner, name, sealed, sealed_key, plain, is_sealed, is_final,
                      expires_at, history, rotation, rotated_at, metadata,
-                     created_at, updated_at, revision)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                     created_at, updated_at, revision, shares)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
             )
             .run(...SqliteStore.bind(record))
         return result.changes > 0
@@ -328,7 +358,8 @@ export class SqliteStore implements VaultStore {
                 `UPDATE ${this.table} SET
                     sealed = ?, sealed_key = ?, plain = ?, is_sealed = ?,
                     is_final = ?, expires_at = ?, history = ?, rotation = ?,
-                    rotated_at = ?, metadata = ?, updated_at = ?, revision = ?
+                    rotated_at = ?, metadata = ?, updated_at = ?, revision = ?,
+                    shares = ?
                  WHERE owner = ? AND name = ? AND revision = ?`
             )
             .run(
@@ -344,6 +375,7 @@ export class SqliteStore implements VaultStore {
                 JSON.stringify(record.metadata),
                 record.updatedAt.getTime(),
                 record.revision ?? 1,
+                JSON.stringify(record.shares ?? []),
                 record.owner,
                 record.name,
                 expectedRevision
@@ -369,6 +401,7 @@ export class SqliteStore implements VaultStore {
             record.createdAt.getTime(),
             record.updatedAt.getTime(),
             record.revision ?? 1,
+            JSON.stringify(record.shares ?? []),
         ]
     }
 
@@ -398,6 +431,126 @@ export class SqliteStore implements VaultStore {
      * handle stops working too. Call it on the owner of the connection only.
      *
      * @returns Nothing; the store is unusable afterwards.
+     */
+    close(): void {
+        this.db.close()
+    }
+}
+
+/**
+ * An audit trail in SQLite, in its own table.
+ *
+ * @remarks
+ * Give it the same `Database` as a {@link SqliteStore} to keep the secrets and
+ * the record of who touched them in one file, or a database of its own to keep
+ * them apart — which is the better arrangement if the two want different
+ * backups or different retention.
+ *
+ * Entries are only ever appended and read. There is deliberately no method
+ * here that deletes one: a log whose own API can quietly remove a line is not
+ * much of a log. Retention is a job for whoever owns the database.
+ *
+ * @example
+ * ```ts
+ * import { Vault } from "@mstone6969/vault"
+ * import { SqliteStore, SqliteAuditLog } from "@mstone6969/vault/stores/sqlite"
+ *
+ * const store = new SqliteStore("./vault.sqlite")
+ * const audit = new SqliteAuditLog("./audit.sqlite")
+ * const vault = new Vault({ key: process.env.VAULT_KEY!, store, audit })
+ * ```
+ *
+ * @see {@link AuditLog}
+ */
+export class SqliteAuditLog implements AuditLog {
+    private readonly db: Database
+    private readonly table: string
+
+    /**
+     * @param database A file path, ":memory:", or a Database already open.
+     * @param table What to call the table.
+     */
+    constructor(database: string | Database = ":memory:", table = "vault_audit") {
+        this.db = typeof database === "string" ? new Database(database) : database
+        this.table = table
+        this.db.run(
+            `CREATE TABLE IF NOT EXISTS ${this.table} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                name TEXT,
+                by TEXT,
+                detail TEXT,
+                at INTEGER NOT NULL
+            )`
+        )
+        this.db.run(`CREATE INDEX IF NOT EXISTS ${this.table}_at ON ${this.table} (at)`)
+    }
+
+    /**
+     * Writes one entry.
+     *
+     * @param entry What happened.
+     * @returns Nothing, once it is in the table.
+     */
+    async append(entry: AuditEntry): Promise<void> {
+        this.db
+            .query(
+                `INSERT INTO ${this.table} (action, owner, name, by, detail, at)
+                 VALUES (?, ?, ?, ?, ?, ?)`
+            )
+            .run(
+                entry.action,
+                entry.owner,
+                entry.name,
+                entry.by ?? null,
+                entry.detail ?? null,
+                entry.at.getTime()
+            )
+    }
+
+    /**
+     * Reads entries back, newest first.
+     *
+     * @param query Which ones. Everything when left out.
+     * @returns The matching entries, newest first.
+     */
+    async entries(query: AuditQuery = {}): Promise<AuditEntry[]> {
+        const where: string[] = []
+        const values: (string | number)[] = []
+
+        if (query.owner !== undefined) (where.push("owner = ?"), values.push(query.owner))
+        if (query.name !== undefined) (where.push("name = ?"), values.push(query.name))
+        if (query.action !== undefined) (where.push("action = ?"), values.push(query.action))
+        if (query.since !== undefined) (where.push("at >= ?"), values.push(query.since.getTime()))
+        if (query.until !== undefined) (where.push("at < ?"), values.push(query.until.getTime()))
+
+        const rows = this.db
+            .query<AuditRow, (string | number)[]>(
+                `SELECT * FROM ${this.table}` +
+                    (where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "") +
+                    ` ORDER BY at DESC, id DESC` +
+                    (query.limit === undefined ? "" : ` LIMIT ${Number(query.limit)}`)
+            )
+            .all(...values)
+
+        return rows.map((row) => {
+            const entry: AuditEntry = {
+                action: row.action as AuditEntry["action"],
+                owner: row.owner,
+                name: row.name,
+                at: new Date(row.at),
+            }
+            if (row.by !== null) entry.by = row.by
+            if (row.detail !== null) entry.detail = row.detail
+            return entry
+        })
+    }
+
+    /**
+     * Closes the underlying database, as {@link SqliteStore.close} does.
+     *
+     * @returns Nothing.
      */
     close(): void {
         this.db.close()

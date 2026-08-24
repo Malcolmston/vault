@@ -1,5 +1,13 @@
 import { SQL } from "bun"
-import type { HistoryEntry, SecretRecord, VaultStore } from "../types"
+import type {
+    AuditEntry,
+    AuditLog,
+    AuditQuery,
+    HistoryEntry,
+    SecretRecord,
+    Share,
+    VaultStore,
+} from "../types"
 
 /** One row of a {@link PostgresStore} table, as Postgres hands it back. */
 type Row = {
@@ -18,6 +26,7 @@ type Row = {
     created_at: Date
     updated_at: Date
     revision: number
+    shares: Share[] | string | null
 }
 
 /**
@@ -109,12 +118,16 @@ export class PostgresStore implements VaultStore {
                 created_at  TIMESTAMPTZ NOT NULL,
                 updated_at  TIMESTAMPTZ NOT NULL,
                 revision    INTEGER NOT NULL DEFAULT 1,
+                shares      JSONB NOT NULL DEFAULT '[]'::jsonb,
                 PRIMARY KEY (owner, name)
             )
         `)
         // Named separately so a table made by an earlier version gains it.
         await this.sql.unsafe(
             `ALTER TABLE "${this.table}" ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 1`
+        )
+        await this.sql.unsafe(
+            `ALTER TABLE "${this.table}" ADD COLUMN IF NOT EXISTS shares JSONB NOT NULL DEFAULT '[]'::jsonb`
         )
     }
 
@@ -158,6 +171,11 @@ export class PostgresStore implements VaultStore {
             createdAt: row.created_at,
             updatedAt: row.updated_at,
             revision: row.revision,
+            shares: PostgresStore.json<Share[]>(row.shares, []).map((share) => ({
+                ...share,
+                expiresAt: share.expiresAt === null ? null : new Date(share.expiresAt),
+                grantedAt: new Date(share.grantedAt),
+            })),
         }
     }
 
@@ -211,8 +229,8 @@ export class PostgresStore implements VaultStore {
             `INSERT INTO "${this.table}"
                 (owner, name, sealed, sealed_key, plain, is_sealed, is_final,
                  expires_at, history, rotation, rotated_at, metadata,
-                 created_at, updated_at, revision)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                 created_at, updated_at, revision, shares)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
              ON CONFLICT (owner, name) DO UPDATE SET
                 sealed = EXCLUDED.sealed,
                 sealed_key = EXCLUDED.sealed_key,
@@ -225,7 +243,8 @@ export class PostgresStore implements VaultStore {
                 rotated_at = EXCLUDED.rotated_at,
                 metadata = EXCLUDED.metadata,
                 updated_at = EXCLUDED.updated_at,
-                revision = EXCLUDED.revision
+                revision = EXCLUDED.revision,
+                shares = EXCLUDED.shares
              RETURNING *`,
             PostgresStore.bind(record)
         )) as Row[]
@@ -257,8 +276,8 @@ export class PostgresStore implements VaultStore {
                       `INSERT INTO "${this.table}"
                         (owner, name, sealed, sealed_key, plain, is_sealed, is_final,
                          expires_at, history, rotation, rotated_at, metadata,
-                         created_at, updated_at, revision)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                         created_at, updated_at, revision, shares)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
                        ON CONFLICT (owner, name) DO NOTHING
                        RETURNING *`,
                       PostgresStore.bind(record)
@@ -268,7 +287,7 @@ export class PostgresStore implements VaultStore {
                         sealed = $3, sealed_key = $4, plain = $5, is_sealed = $6,
                         is_final = $7, expires_at = $8, history = $9, rotation = $10,
                         rotated_at = $11, metadata = $12, updated_at = $13,
-                        revision = $14
+                        revision = $14, shares = $16
                        WHERE owner = $1 AND name = $2 AND revision = $15
                        RETURNING *`,
                       [
@@ -287,6 +306,7 @@ export class PostgresStore implements VaultStore {
                           record.updatedAt,
                           record.revision ?? 1,
                           expectedRevision,
+                          JSON.stringify(record.shares ?? []),
                       ]
                   )
         ) as Row[]
@@ -312,6 +332,7 @@ export class PostgresStore implements VaultStore {
             record.createdAt,
             record.updatedAt,
             record.revision ?? 1,
+            JSON.stringify(record.shares ?? []),
         ]
     }
 
@@ -340,6 +361,145 @@ export class PostgresStore implements VaultStore {
      * that pool is yours, and something else is probably still using it.
      *
      * @returns Nothing, once the pool is closed.
+     */
+    async close(): Promise<void> {
+        if (!this.borrowed) await this.sql.close()
+    }
+}
+
+/**
+ * An audit trail in PostgreSQL.
+ *
+ * @remarks
+ * The log to use when several processes share a vault, for the same reason
+ * {@link PostgresStore} is: they can all append to it at once, and the record
+ * is one record rather than one per machine.
+ *
+ * Entries are only ever appended and read. There is deliberately no method
+ * here that deletes one — retention belongs to whoever owns the database, not
+ * to the library writing the lines.
+ *
+ * @example
+ * ```ts
+ * import { Vault } from "@mstone6969/vault"
+ * import { PostgresStore, PostgresAuditLog } from "@mstone6969/vault/stores/postgres"
+ *
+ * const store = new PostgresStore(process.env.DATABASE_URL!)
+ * const audit = new PostgresAuditLog(process.env.DATABASE_URL!)
+ * await store.migrate()
+ * await audit.migrate()
+ *
+ * const vault = new Vault({ key: process.env.VAULT_KEY!, store, audit })
+ * ```
+ *
+ * @see {@link AuditLog}
+ */
+export class PostgresAuditLog implements AuditLog {
+    private readonly sql: SQL
+    private readonly table: string
+    private readonly borrowed: boolean
+
+    /**
+     * @param database A connection string, or a `SQL` client you already have.
+     * @param table What to call the table. Must be a plain identifier.
+     * @throws When `table` is not a plain identifier.
+     */
+    constructor(database: string | SQL, table = "vault_audit") {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
+            throw new Error(`"${table}" is not a usable table name.`)
+        }
+        this.borrowed = typeof database !== "string"
+        this.sql = typeof database === "string" ? new SQL(database) : database
+        this.table = table
+    }
+
+    /**
+     * Creates the table if it is not there.
+     *
+     * Safe to run on every start, and from several processes at once.
+     *
+     * @returns Nothing, once the table exists.
+     */
+    async migrate(): Promise<void> {
+        await this.sql.unsafe(`
+            CREATE TABLE IF NOT EXISTS "${this.table}" (
+                id      BIGSERIAL PRIMARY KEY,
+                action  TEXT NOT NULL,
+                owner   TEXT NOT NULL,
+                name    TEXT,
+                by      TEXT,
+                detail  TEXT,
+                at      TIMESTAMPTZ NOT NULL
+            )
+        `)
+        await this.sql.unsafe(
+            `CREATE INDEX IF NOT EXISTS "${this.table}_at" ON "${this.table}" (at)`
+        )
+    }
+
+    /**
+     * Writes one entry.
+     *
+     * @param entry What happened.
+     * @returns Nothing, once the database has it.
+     */
+    async append(entry: AuditEntry): Promise<void> {
+        await this.sql.unsafe(
+            `INSERT INTO "${this.table}" (action, owner, name, by, detail, at)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [entry.action, entry.owner, entry.name, entry.by ?? null, entry.detail ?? null, entry.at]
+        )
+    }
+
+    /**
+     * Reads entries back, newest first.
+     *
+     * @param query Which ones. Everything when left out.
+     * @returns The matching entries, newest first.
+     */
+    async entries(query: AuditQuery = {}): Promise<AuditEntry[]> {
+        const where: string[] = []
+        const values: unknown[] = []
+        const next = () => `$${values.length + 1}`
+
+        if (query.owner !== undefined) (where.push(`owner = ${next()}`), values.push(query.owner))
+        if (query.name !== undefined) (where.push(`name = ${next()}`), values.push(query.name))
+        if (query.action !== undefined) (where.push(`action = ${next()}`), values.push(query.action))
+        if (query.since !== undefined) (where.push(`at >= ${next()}`), values.push(query.since))
+        if (query.until !== undefined) (where.push(`at < ${next()}`), values.push(query.until))
+
+        const rows = (await this.sql.unsafe(
+            `SELECT * FROM "${this.table}"` +
+                (where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "") +
+                ` ORDER BY at DESC, id DESC` +
+                (query.limit === undefined ? "" : ` LIMIT ${Number(query.limit)}`),
+            values
+        )) as {
+            action: string
+            owner: string
+            name: string | null
+            by: string | null
+            detail: string | null
+            at: Date
+        }[]
+
+        return rows.map((row) => {
+            const entry: AuditEntry = {
+                action: row.action as AuditEntry["action"],
+                owner: row.owner,
+                name: row.name,
+                at: row.at,
+            }
+            if (row.by !== null) entry.by = row.by
+            if (row.detail !== null) entry.detail = row.detail
+            return entry
+        })
+    }
+
+    /**
+     * Closes the connection pool, unless it was passed in.
+     *
+     * @returns Nothing.
      */
     async close(): Promise<void> {
         if (!this.borrowed) await this.sql.close()

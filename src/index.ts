@@ -7,6 +7,7 @@
  * cannot resolve, so it lives at `@mstone6969/vault/stores/sqlite`.
  */
 export * from "./vault"
+export * from "./audit"
 export * from "./crypto"
 export * from "./errors"
 export * from "./providers"

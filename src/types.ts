@@ -230,6 +230,50 @@ export type SecretRecord = {
      * @defaultValue 1
      */
     revision?: number
+    /**
+     * Who else may read this entry, besides the owner.
+     *
+     * @remarks
+     * Grants are read-only by design: writing, rotating and deleting stay with
+     * the owner however widely an entry is shared. A grant that could be used
+     * to overwrite the credential would make "shared with" mean "owned by".
+     *
+     * Stored in the clear, like metadata — who can see a secret is not itself
+     * a secret, and a listing that had to open every entry to answer "who has
+     * access" would be worse for everyone.
+     *
+     * Optional, and read as none when absent, so a store written against an
+     * earlier version keeps working.
+     *
+     * @defaultValue none
+     */
+    shares?: Share[]
+}
+
+/**
+ * Permission for one other owner to read one entry.
+ *
+ * @remarks
+ * Made by {@link Vault.share}, withdrawn by {@link Vault.unshare}, and listed
+ * by {@link Vault.shares}. The reader names the entry through the owner it
+ * belongs to — `open("bob", "token", { from: "alice" })` — so a grant never
+ * collides with something the reader already keeps under that name.
+ *
+ * @see {@link Vault.share}
+ */
+export type Share = {
+    /** The owner who may read it. */
+    with: string
+    /**
+     * When the grant lapses, or null if it does not.
+     *
+     * @remarks
+     * A lapsed grant refuses like an absent one. The entry itself is untouched:
+     * this is the grant expiring, not the secret.
+     */
+    expiresAt: Date | null
+    /** When the grant was made. */
+    grantedAt: Date
 }
 
 /**
@@ -481,9 +525,27 @@ export type VaultEvent = {
      * `open` is a sealed value coming out, `read` an entry stored in the open.
      * A `rotate` is also recorded as the `put` that carries it out.
      */
-    action: "put" | "open" | "read" | "remove" | "rotate" | "rekey" | "denied"
+    action:
+        | "put"
+        | "open"
+        | "read"
+        | "remove"
+        | "rotate"
+        | "rekey"
+        | "share"
+        | "unshare"
+        | "denied"
     /** Whose entry it was. Empty for vault-wide actions. */
     owner: string
+    /**
+     * Who did it, when that is not the owner.
+     *
+     * @remarks
+     * Set when a grant was used: `owner` is whose secret it was, `by` is who
+     * read it. Absent when the owner acted on their own entry, which is the
+     * ordinary case.
+     */
+    by?: string
     /** The entry involved, or null for vault-wide actions like `rekey`. */
     name: string | null
     /** When it happened. */
@@ -498,4 +560,79 @@ export type VaultEvent = {
      * many would not open.
      */
     detail?: string
+}
+
+/**
+ * One line of a stored audit trail: a {@link VaultEvent} that was written down.
+ *
+ * @see {@link AuditLog}
+ */
+export type AuditEntry = VaultEvent
+
+/**
+ * Which entries of an audit trail to read back.
+ *
+ * @remarks
+ * Every field narrows; leaving them all out asks for everything, newest first.
+ *
+ * @see {@link AuditLog.entries}
+ */
+export type AuditQuery = {
+    /** Only entries about this owner's secrets. */
+    owner?: string
+    /** Only entries about one secret. Needs `owner` to mean anything. */
+    name?: string
+    /** Only this kind of action. */
+    action?: VaultEvent["action"]
+    /** Only what happened at or after this moment. */
+    since?: Date
+    /** Only what happened before this moment. */
+    until?: Date
+    /** At most this many, newest first. */
+    limit?: number
+}
+
+/**
+ * Where an audit trail is kept.
+ *
+ * @remarks
+ * Set {@link VaultOptions.audit} and every action the vault takes is written
+ * here before it is allowed to finish — including the refusals, which are the
+ * ones an investigation usually wants.
+ *
+ * By default a log that cannot be written **stops the operation**. That is the
+ * point of an audit trail: one that silently loses entries is worse than none,
+ * because it looks like evidence. Pass `{ log, required: false }` to make it
+ * best-effort instead, where a failed write is swallowed and the vault carries
+ * on.
+ *
+ * `MemoryAuditLog` ships in the main entry; `SqliteAuditLog` and
+ * `PostgresAuditLog` ship beside their stores.
+ *
+ * @example
+ * ```ts
+ * import { MemoryAuditLog, Vault } from "@mstone6969/vault"
+ *
+ * const audit = new MemoryAuditLog()
+ * const vault = new Vault({ key, store, audit })
+ *
+ * await vault.put("alice", "token", "value")
+ * await audit.entries({ owner: "alice" })
+ * ```
+ */
+export type AuditLog = {
+    /**
+     * Writes one entry.
+     *
+     * @param entry What happened.
+     * @returns Nothing, once it is safely written.
+     */
+    append(entry: AuditEntry): Promise<void>
+    /**
+     * Reads entries back, newest first.
+     *
+     * @param query Which ones. Everything when left out.
+     * @returns The matching entries, newest first.
+     */
+    entries(query?: AuditQuery): Promise<AuditEntry[]>
 }

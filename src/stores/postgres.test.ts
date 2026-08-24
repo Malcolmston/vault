@@ -3,9 +3,9 @@
  * the database does with two writers at once, and a fake would only test the
  * fake. Skipped when there is nowhere to connect to.
  */
-import { afterAll, beforeEach, describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { generateKey, Vault } from "../index"
-import { PostgresStore } from "./postgres"
+import { PostgresAuditLog, PostgresStore } from "./postgres"
 
 const URL = process.env.VAULT_TEST_DATABASE_URL
 const TABLE = "vault_test_secrets"
@@ -116,6 +116,105 @@ describe.skipIf(!URL)("PostgresStore", () => {
         await borrower.close()
         // Still usable, because closing a borrowed pool is not ours to do.
         await expect(borrower.all()).resolves.toBeDefined()
+        await shared.close()
+    })
+})
+
+describe.skipIf(!URL)("PostgresAuditLog", () => {
+    const AUDIT_TABLE = "vault_test_audit"
+    const log = new PostgresAuditLog(URL ?? "", AUDIT_TABLE)
+    const store = new PostgresStore(URL ?? "", TABLE)
+    // The log itself has no way to delete a line, on purpose, so emptying it
+    // between tests is the fixture's job rather than the library's.
+    let sql: import("bun").SQL
+
+    beforeAll(async () => {
+        const { SQL } = await import("bun")
+        sql = new SQL(URL ?? "")
+    })
+
+    beforeEach(async () => {
+        await log.migrate()
+        await store.migrate()
+        await sql.unsafe(`TRUNCATE "${AUDIT_TABLE}"`)
+        for (const record of await store.all()) {
+            await store.remove(record.owner, record.name)
+        }
+    })
+
+    afterAll(async () => {
+        await log.close()
+        await store.close()
+        await sql.close()
+    })
+
+    test("a table name that is not an identifier is refused", () => {
+        expect(() => new PostgresAuditLog(URL ?? "", "not valid")).toThrow(
+            /not a usable table name/
+        )
+    })
+
+    test("migrating twice is not an error", async () => {
+        await expect(log.migrate()).resolves.toBeUndefined()
+    })
+
+    test("it records what happened, and answers every way of asking", async () => {
+        const vault = new Vault({ key: generateKey(), store, audit: log })
+
+        await vault.put("alice", "db", "hunter2")
+        await vault.share("alice", "db", { with: "bob" })
+        await vault.open("bob", "db", { from: "alice" })
+        await vault.put("carol", "other", "x")
+
+        expect((await log.entries()).map((entry) => entry.action)).toEqual([
+            "put",
+            "open",
+            "share",
+            "put",
+        ])
+
+        const [read] = await log.entries({ action: "open" })
+        expect(read).toMatchObject({ owner: "alice", name: "db", by: "bob" })
+        expect(read?.at).toBeInstanceOf(Date)
+
+        expect(await log.entries({ owner: "carol" })).toHaveLength(1)
+        expect(await log.entries({ name: "db" })).toHaveLength(3)
+        expect(await log.entries({ limit: 2 })).toHaveLength(2)
+        expect(await log.entries({ since: new Date(Date.now() + 60_000) })).toHaveLength(0)
+        expect(await log.entries({ until: new Date(Date.now() + 60_000) })).toHaveLength(4)
+    })
+
+    test("a failed append stops the operation it was recording", async () => {
+        // A log pointed at a table that was never created.
+        const missing = new PostgresAuditLog(URL ?? "", "vault_audit_absent")
+        const vault = new Vault({ key: generateKey(), store, audit: missing })
+
+        await expect(vault.put("alice", "db", "hunter2")).rejects.toThrow(/would not take this put/)
+        await missing.close()
+    })
+
+    test("grants survive the round trip", async () => {
+        const vault = new Vault({ key: generateKey(), store })
+        const until = new Date(Date.now() + 60_000)
+
+        await vault.put("alice", "db", "hunter2")
+        await vault.share("alice", "db", { with: "bob", expiresAt: until })
+        await vault.rotate("alice", "db", "next")
+
+        const [grant] = await vault.shares("alice", "db")
+        expect(grant?.with).toBe("bob")
+        expect(grant?.expiresAt?.getTime()).toBe(until.getTime())
+        expect(grant?.grantedAt).toBeInstanceOf(Date)
+        expect(await vault.open("bob", "db", { from: "alice" })).toBe("next")
+    })
+
+    test("a client passed in is left open for whoever owns it", async () => {
+        const { SQL } = await import("bun")
+        const shared = new SQL(URL ?? "")
+        const borrower = new PostgresAuditLog(shared, "vault_test_audit")
+
+        await borrower.close()
+        await expect(borrower.entries()).resolves.toBeDefined()
         await shared.close()
     })
 })

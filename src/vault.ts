@@ -2,10 +2,12 @@ import { generateKey, importKey, open, seal } from "./crypto"
 import { VaultError, VaultKeyError } from "./errors"
 import { isKeyProvider, staticKey, type KeyProvider } from "./providers"
 import type {
+    AuditLog,
     PutOptions,
     RotationPolicy,
     SecretRecord,
     SecretSummary,
+    Share,
     VaultEvent,
     VaultStore,
 } from "./types"
@@ -232,6 +234,33 @@ export type VaultOptions = {
      * @defaultValue false
      */
     strictWrites?: boolean
+    /**
+     * Where to write an audit trail that outlives the process.
+     *
+     * @remarks
+     * Unlike {@link VaultOptions.onAccess}, which is a callback the vault does
+     * not wait for, this is awaited — and by default a log that cannot be
+     * written **fails the operation**. An audit trail with silent gaps is worse
+     * than no audit trail, because it looks like evidence. Pass
+     * `{ log, required: false }` for a best-effort log instead.
+     *
+     * Both can be set: the callback for live logging, the log for the record.
+     *
+     * @defaultValue none
+     * @see {@link AuditLog}
+     */
+    audit?:
+        | AuditLog
+        | {
+              /** Where to write it. */
+              log: AuditLog
+              /**
+               * Whether a log that cannot be written should fail the operation.
+               *
+               * @defaultValue true
+               */
+              required?: boolean
+          }
 }
 
 /** {@link PutOptions} plus what only the vault itself may set. */
@@ -255,6 +284,21 @@ export type RotateDueReport = {
         /** What went wrong, as the error said it. */
         reason: string
     }[]
+}
+
+/** Who is reading, when it is not the entry's own owner. */
+export type Access = {
+    /**
+     * The owner the entry belongs to, for reading something shared with you.
+     *
+     * @remarks
+     * Left out, the entry is the caller's own. Naming an owner asks for their
+     * entry instead, which works only if they shared it — and keeps a grant
+     * from colliding with something the caller already keeps under that name.
+     *
+     * @see {@link Vault.share}
+     */
+    from?: string
 }
 
 /**
@@ -343,6 +387,8 @@ export class Vault {
     private readonly generators: Record<string, Generator>
     private readonly onAccess: ((event: VaultEvent) => void) | undefined
     private readonly strictWrites: boolean
+    private readonly audit: AuditLog | undefined
+    private readonly auditRequired: boolean
     /** The prefix {@link Vault.resolve} treats as a reference. */
     readonly prefix: string
 
@@ -361,6 +407,7 @@ export class Vault {
         generators = {},
         onAccess,
         strictWrites = false,
+        audit,
     }: VaultOptions) {
         this.keySource = key
         this.previousSources = previousKeys
@@ -370,6 +417,10 @@ export class Vault {
         this.generators = generators
         this.onAccess = onAccess
         this.strictWrites = strictWrites
+
+        const settings = audit && "log" in audit ? audit : { log: audit, required: true }
+        this.audit = settings.log
+        this.auditRequired = settings.required ?? true
     }
 
     private master(): Promise<CryptoKey> {
@@ -382,12 +433,49 @@ export class Vault {
         return this.previousCache
     }
 
-    private record(event: Omit<VaultEvent, "at">): void {
-        if (!this.onAccess) return
+    /**
+     * Reports one action to `onAccess` and, if there is one, writes it to the
+     * audit log.
+     *
+     * @remarks
+     * `onAccess` stays fire-and-forget: it is a callback for logging, and a
+     * logger that throws must not take the vault with it.
+     *
+     * A stored audit log is the opposite. It is awaited, and by default a log
+     * that cannot be written fails the operation — an audit trail that silently
+     * loses entries is worse than none at all, because it looks like evidence.
+     *
+     * The entry is written after the action and before the call returns, so a
+     * failed append reports an operation that did in fact happen. That is the
+     * cost of recording outcomes rather than intentions, and it fails in the
+     * safe direction: the caller is told something went wrong.
+     *
+     * @param event What happened.
+     * @returns Nothing, once it is recorded.
+     * @throws {@link VaultError} 500 when a required audit log will not take it.
+     */
+    private async record(event: Omit<VaultEvent, "at">): Promise<void> {
+        const entry: VaultEvent = { ...event, at: new Date() }
+
+        if (this.onAccess) {
+            try {
+                this.onAccess(entry)
+            } catch {
+                // An audit trail that throws must not take the vault with it.
+            }
+        }
+
+        if (!this.audit) return
+
         try {
-            this.onAccess({ ...event, at: new Date() })
-        } catch {
-            // An audit trail that throws must not take the vault with it.
+            await this.audit.append(entry)
+        } catch (error) {
+            if (!this.auditRequired) return
+            throw new VaultError(
+                `The audit log would not take this ${entry.action}, so it was refused: ` +
+                    `${error instanceof Error ? error.message : String(error)}`,
+                500
+            )
         }
     }
 
@@ -529,7 +617,7 @@ export class Vault {
 
         const existing = await this.store.get(owner, clean)
         if (existing?.isFinal) {
-            this.record({ action: "denied", owner, name: clean, detail: "final" })
+            await this.record({ action: "denied", owner, name: clean, detail: "final" })
             throw new VaultError(
                 `"${clean}" is final: it cannot be changed, only deleted.`,
                 409
@@ -579,10 +667,13 @@ export class Vault {
             // A record from before revisions reads as 1, so it must be written
             // back as 2 — counting from 0 would leave it stuck at 1 forever.
             revision: (existing ? (existing.revision ?? 1) : 0) + 1,
+            // Grants survive a replacement, like everything else about an
+            // entry: rotating a shared credential must not quietly revoke it.
+            shares: existing?.shares ?? [],
         }
 
         const stored = await this.write(record, existing, options.expectedRevision)
-        this.record({ action: "put", owner, name: clean })
+        await this.record({ action: "put", owner, name: clean })
         return summarise(stored)
     }
 
@@ -626,7 +717,7 @@ export class Vault {
             }
         }
 
-        this.record({
+        await this.record({
             action: "denied",
             owner: record.owner,
             name: record.name,
@@ -689,7 +780,7 @@ export class Vault {
         const clean = this.checkName(name)
         const next = value ?? (await this.generate(owner, clean))
 
-        this.record({ action: "rotate", owner, name: clean })
+        await this.record({ action: "rotate", owner, name: clean })
         return this.put(owner, clean, next, {
             ...options,
             keepHistory: true,
@@ -877,7 +968,7 @@ export class Vault {
         if (expectedRevision !== undefined) {
             const current = await this.store.get(owner, clean)
             if (current && (current.revision ?? 1) !== expectedRevision) {
-                this.record({ action: "denied", owner, name: clean, detail: "revision" })
+                await this.record({ action: "denied", owner, name: clean, detail: "revision" })
                 throw new VaultError(
                     `"${clean}" has changed since revision ${expectedRevision}.`,
                     409
@@ -900,7 +991,7 @@ export class Vault {
         if (!record) throw new VaultError(`No secret named "${clean}" in the vault.`, 404)
 
         if (isExpired(record, now)) {
-            this.record({ action: "denied", owner, name: clean, detail: "expired" })
+            await this.record({ action: "denied", owner, name: clean, detail: "expired" })
             throw new VaultError(`"${clean}" expired and can no longer be used.`, 410)
         }
         return record
@@ -930,13 +1021,13 @@ export class Vault {
      * @see {@link Vault.read} for entries stored in the open,
      *   {@link Vault.resolve} for substituting several at once.
      */
-    async open(owner: string, name: string): Promise<string> {
-        const record = await this.require(owner, name)
+    async open(owner: string, name: string, { from }: Access = {}): Promise<string> {
+        const record = await this.reach(owner, name, from)
         const value = record.isSealed
             ? await this.unseal(record.sealed, record.sealedKey)
             : (record.plain ?? "")
 
-        this.record({ action: "open", owner, name })
+        await this.record({ action: "open", owner: record.owner, name, by: from && owner })
         return value
     }
 
@@ -962,15 +1053,56 @@ export class Vault {
      * await vault.read("alice", "token")   // throws: 403, sealed
      * ```
      */
-    async read(owner: string, name: string): Promise<string> {
-        const record = await this.require(owner, name)
+    async read(owner: string, name: string, { from }: Access = {}): Promise<string> {
+        const record = await this.reach(owner, name, from)
         if (record.isSealed) {
-            this.record({ action: "denied", owner, name, detail: "sealed" })
+            await this.record({ action: "denied", owner: record.owner, name, detail: "sealed" })
             throw new VaultError(`"${name}" is sealed and cannot be read back.`, 403)
         }
 
-        this.record({ action: "read", owner, name })
+        await this.record({ action: "read", owner: record.owner, name, by: from && owner })
         return record.plain ?? ""
+    }
+
+    /**
+     * The record behind a read, whether it is the caller's own or one shared
+     * with them.
+     *
+     * @param caller Who is asking.
+     * @param name The entry they want.
+     * @param from The owner it belongs to, when that is not the caller.
+     * @returns The record, if they are allowed it.
+     * @throws {@link VaultError} 404 when there is no such entry.
+     * @throws {@link VaultError} 403 when it exists but is not shared with
+     *   them, or the grant has lapsed.
+     * @throws {@link VaultError} 410 when the entry has expired.
+     */
+    private async reach(
+        caller: string,
+        name: string,
+        from: string | undefined
+    ): Promise<SecretRecord> {
+        if (from === undefined || from === caller) return this.require(caller, name)
+
+        const now = new Date()
+        const record = await this.require(from, name, now)
+        const granted = (record.shares ?? []).find((share) => share.with === caller)
+
+        if (!granted || (granted.expiresAt !== null && granted.expiresAt <= now)) {
+            await this.record({
+                action: "denied",
+                owner: from,
+                name,
+                by: caller,
+                detail: granted ? "grant expired" : "not shared",
+            })
+            throw new VaultError(
+                `"${name}" belongs to ${from} and is not shared with ${caller}.`,
+                403
+            )
+        }
+
+        return record
     }
 
     /**
@@ -1000,6 +1132,10 @@ export class Vault {
      * Whitespace around the name is ignored, so `"@vault: token "` finds
      * `token`. Sealed and open entries both resolve; the prefix comes from
      * {@link Vault.prefix}.
+     *
+     * `"@vault:alice/token"` reaches a secret alice shared with the caller.
+     * A name cannot contain a slash, so that form is never mistaken for one of
+     * the caller's own entries.
      *
      * @example Filling in an environment before spawning something
      * ```ts
@@ -1041,9 +1177,19 @@ export class Vault {
         seen: WeakSet<object>
     ): Promise<unknown> {
         if (typeof value === "string") {
-            return value.startsWith(this.prefix)
-                ? this.open(owner, value.slice(this.prefix.length).trim())
-                : value
+            if (!value.startsWith(this.prefix)) return value
+
+            // "@vault:alice/token" reaches a secret alice shared; "@vault:token"
+            // is the caller's own. A slash cannot appear in a name, so the two
+            // forms can never be confused for one another.
+            const reference = value.slice(this.prefix.length).trim()
+            const slash = reference.indexOf("/")
+
+            return slash === -1
+                ? this.open(owner, reference)
+                : this.open(owner, reference.slice(slash + 1), {
+                      from: reference.slice(0, slash),
+                  })
         }
 
         if (value === null || typeof value !== "object") return value
@@ -1209,7 +1355,7 @@ export class Vault {
         this.keyCache = Promise.resolve(nextKey)
         this.previousCache = null
 
-        this.record({
+        await this.record({
             action: "rekey",
             owner: "",
             name: null,
@@ -1292,7 +1438,7 @@ export class Vault {
             })
         }
 
-        this.record({
+        await this.record({
             action: "open",
             owner: owner ?? "",
             name: null,
@@ -1374,13 +1520,186 @@ export class Vault {
             report.imported += 1
         }
 
-        this.record({
+        await this.record({
             action: "put",
             owner: "",
             name: null,
             detail: `imported ${report.imported} entries`,
         })
         return report
+    }
+
+    /**
+     * Lets another owner read one of your entries.
+     *
+     * @remarks
+     * Read-only, always. Writing, rotating and deleting stay with the owner
+     * however widely an entry is shared — a grant that could overwrite the
+     * credential would make "shared with" mean "owned by".
+     *
+     * The reader reaches it by naming who it belongs to:
+     * `open("bob", "token", { from: "alice" })`. That is deliberately explicit,
+     * so a grant can never quietly shadow something the reader already keeps
+     * under the same name.
+     *
+     * Sharing again with the same owner replaces the grant rather than adding
+     * a second one, which is how you change or remove an expiry.
+     *
+     * @param owner Whose entry it is. Only they can share it.
+     * @param name The entry to share.
+     * @param options `with` names the owner who may read it; `expiresAt` makes
+     *   the grant temporary.
+     * @returns The entry, summarised.
+     * @throws {@link VaultError} 404 when there is no such entry.
+     * @throws {@link VaultError} 410 when the entry has expired.
+     * @throws {@link VaultError} 422 when the name is not a legal one, or when
+     *   an owner is asked to share with themselves.
+     *
+     * @example
+     * ```ts
+     * await vault.share("alice", "deploy-key", { with: "bob" })
+     * await vault.open("bob", "deploy-key", { from: "alice" })
+     *
+     * // Until Friday only.
+     * await vault.share("alice", "db", { with: "carol", expiresAt: friday })
+     * ```
+     *
+     * @see {@link Vault.unshare} to withdraw it, {@link Vault.shares} to see
+     *   who has one.
+     */
+    async share(
+        owner: string,
+        name: string,
+        { with: reader, expiresAt = null }: { with: string; expiresAt?: Date | null }
+    ): Promise<SecretSummary> {
+        const clean = this.checkName(name)
+        if (!reader) throw new VaultError("A grant needs somebody to grant it to.")
+        if (reader === owner) {
+            throw new VaultError(`${owner} already owns "${clean}".`)
+        }
+
+        const record = await this.require(owner, clean)
+        const shares = [
+            ...(record.shares ?? []).filter((share) => share.with !== reader),
+            { with: reader, expiresAt, grantedAt: new Date() },
+        ]
+
+        // Through the guarded path like any other change to an entry: a grant
+        // added at the same moment as a value must not be lost to it.
+        const stored = await this.write(
+            { ...record, shares, updatedAt: new Date(), revision: (record.revision ?? 1) + 1 },
+            record,
+            undefined
+        )
+        await this.record({ action: "share", owner, name: clean, detail: reader })
+        return summarise(stored)
+    }
+
+    /**
+     * Withdraws a grant.
+     *
+     * @remarks
+     * Takes effect at once: the next read by that owner is refused. It says
+     * nothing about what they already read and kept, which is why a withdrawn
+     * grant is a reason to rotate the value as well.
+     *
+     * @param owner Whose entry it is.
+     * @param name The entry to stop sharing.
+     * @param options `with` names the owner to withdraw from.
+     * @returns Whether there was a grant to withdraw.
+     * @throws {@link VaultError} 404 when there is no such entry.
+     * @throws {@link VaultError} 410 when the entry has expired.
+     * @throws {@link VaultError} 422 when the name is not a legal one.
+     *
+     * @example
+     * ```ts
+     * await vault.unshare("alice", "deploy-key", { with: "bob" })
+     * // Bob cannot read it again — but rotate it too, if he already has.
+     * await vault.rotate("alice", "deploy-key")
+     * ```
+     */
+    async unshare(
+        owner: string,
+        name: string,
+        { with: reader }: { with: string }
+    ): Promise<boolean> {
+        const clean = this.checkName(name)
+        const record = await this.require(owner, clean)
+        const shares = (record.shares ?? []).filter((share) => share.with !== reader)
+
+        if (shares.length === (record.shares ?? []).length) return false
+
+        await this.write(
+            { ...record, shares, updatedAt: new Date(), revision: (record.revision ?? 1) + 1 },
+            record,
+            undefined
+        )
+        await this.record({ action: "unshare", owner, name: clean, detail: reader })
+        return true
+    }
+
+    /**
+     * Who can read one of your entries, besides you.
+     *
+     * @param owner Whose entry it is.
+     * @param name The entry to ask about.
+     * @returns The grants on it, lapsed ones included — a grant that has run
+     *   out is still a fact about who once had access, and hiding it would make
+     *   this a worse answer to "who could have seen this".
+     * @throws {@link VaultError} 404 when there is no such entry.
+     * @throws {@link VaultError} 410 when the entry has expired.
+     * @throws {@link VaultError} 422 when the name is not a legal one.
+     *
+     * @example
+     * ```ts
+     * for (const { with: who, expiresAt } of await vault.shares("alice", "db")) {
+     *     console.log(who, expiresAt ?? "indefinitely")
+     * }
+     * ```
+     */
+    async shares(owner: string, name: string): Promise<Share[]> {
+        const record = await this.require(owner, this.checkName(name))
+        return record.shares ?? []
+    }
+
+    /**
+     * Everything other owners have shared with you.
+     *
+     * @remarks
+     * The other direction from {@link Vault.shares}: not "who can read mine"
+     * but "what can I read". Walks every owner's entries, so it is the one read
+     * that crosses the whole store.
+     *
+     * Lapsed grants are left out here, because this answers what the caller can
+     * actually open right now.
+     *
+     * @param reader Who is asking.
+     * @param now What to treat as the current time, for testing.
+     * @returns The entries shared with them, each summarised, with the owner to
+     *   pass as `from`.
+     *
+     * @example
+     * ```ts
+     * for (const entry of await vault.sharedWith("bob")) {
+     *     await vault.open("bob", entry.name, { from: entry.owner })
+     * }
+     * ```
+     */
+    async sharedWith(reader: string, now = new Date()): Promise<SecretSummary[]> {
+        const records = await this.store.all()
+
+        return records
+            .filter((record) => {
+                if (record.owner === reader || isExpired(record, now)) return false
+                const granted = (record.shares ?? []).find((share) => share.with === reader)
+                return Boolean(granted) && !(granted!.expiresAt && granted!.expiresAt <= now)
+            })
+            .map(summarise)
+            .sort((a, b) =>
+                a.owner === b.owner
+                    ? a.name.localeCompare(b.name)
+                    : a.owner.localeCompare(b.owner)
+            )
     }
 
     /**
