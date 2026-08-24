@@ -88,3 +88,48 @@ jobs:
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
           # prepublishOnly already ran above, step by step.
           npm publish --access public --ignore-scripts
+
+  # The same artifact, published a second time to GitHub Packages.
+  #
+  # That registry insists a package's scope is the repository owner's, in
+  # lowercase, so it goes out as @malcolmston/vault rather than the
+  # @mstone6969/vault npmjs.com knows. Same code, same version, different name —
+  # npmjs.com remains the one to depend on.
+  github-packages:
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.dry_run == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Lets GITHUB_TOKEN publish, so no personal access token is needed here.
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun run docs
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+          scope: "@malcolmston"
+
+      - name: Publish to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Rename for this registry only; the working copy is thrown away with
+          # the runner, so nothing about the npmjs.com package changes.
+          node -e "
+            const fs = require('fs')
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+            pkg.name = '@malcolmston/vault'
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n')
+          "
+          version="$(node -p "require('./package.json').version")"
+          if npm view "@malcolmston/vault@${version}" version >/dev/null 2>&1; then
+            echo "::notice::${version} is already on GitHub Packages; nothing to do."
+            exit 0
+          fi
+          npm publish --ignore-scripts

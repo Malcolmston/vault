@@ -8,6 +8,13 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## Unreleased
+
+- Releases also go to GitHub Packages as `@malcolmston/vault`. That registry
+  requires a package's scope to be the repository owner's, so the name differs
+  from npmjs.com's `@mstone6969/vault` while the code and version do not.
+  It publishes with `GITHUB_TOKEN`, so it needs no secret of its own.
+
 ## 0.5.5 — 2026-08-24
 
 The first release published by CI rather than from a laptop.
