@@ -297,36 +297,8 @@ reference cannot fall behind the code the way a table in this file can.
 
 ## Versions
 
-**0.5.4** — repository, homepage and issues metadata, so the README's links to
-the reference resolve on npmjs.com and the package points back at its source.
-The licence file ships too. No code changes.
-
-**0.5.3** — the README points at the generated reference rather than repeating
-it in a table that had already drifted (it still described `put`'s fourth
-argument as bare metadata, which 0.5.0 changed to an options object). No code
-changes; 0.5.1 and 0.5.2 were not used.
-
-**0.5.0** — envelope encryption (each value gets its own data key), entry
-lifecycle (`open`, `final`, `expiresAt`, `rotate`/`versions`, `reseal`,
-`purgeExpired`), rotation policies that say how to make the next value without
-storing it, key providers (`envKey`, `fileKey`, `staticKey`), an `onAccess`
-audit hook, `FileStore` — an encrypted single-file store that hides names as
-well as values — and a generated API reference in `docs/`.
-
-Breaking: `put`'s fourth argument is now an options object — `put(owner, name,
-value, { metadata })` rather than `put(owner, name, value, metadata)` — and
-`VaultStore.put` takes a whole record. Values written by 0.2.0 and earlier open
-unchanged.
-
-**0.3.0** — `rekey(nextKey)` re-seals every value under a new key, and
-`previousKeys` lets a vault open values sealed under keys it has retired.
-`VaultStore` gains `all()`, which a custom store must implement.
-
-**0.2.0** — `put` takes optional non-secret `metadata`, and `SecretRecord`
-carries it. Existing calls keep working: metadata defaults to `{}`. A
-`SqliteStore` table written by 0.1.0 gains the column on open.
-
-**0.1.0** — first release.
+Every published version, and what changed, is in
+[CHANGELOG.md](./CHANGELOG.md).
 
 ## Releasing
 
