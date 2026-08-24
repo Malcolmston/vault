@@ -16,6 +16,7 @@ type Row = {
     metadata: string | null
     created_at: number
     updated_at: number
+    revision: number | null
 }
 
 /** Columns added after 0.1.0, applied to tables that predate them. */
@@ -29,6 +30,7 @@ const LATER_COLUMNS: [string, string][] = [
     ["rotation", "TEXT"],
     ["rotated_at", "INTEGER"],
     ["metadata", "TEXT"],
+    ["revision", "INTEGER NOT NULL DEFAULT 1"],
 ]
 
 /**
@@ -164,6 +166,7 @@ export class SqliteStore implements VaultStore {
             metadata: row.metadata ? (JSON.parse(row.metadata) as Record<string, string>) : {},
             createdAt: new Date(row.created_at),
             updatedAt: new Date(row.updated_at),
+            revision: row.revision ?? 1,
         }
     }
 
@@ -238,8 +241,8 @@ export class SqliteStore implements VaultStore {
                 `INSERT INTO ${this.table}
                     (owner, name, sealed, sealed_key, plain, is_sealed, is_final,
                      expires_at, history, rotation, rotated_at, metadata,
-                     created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     created_at, updated_at, revision)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(owner, name) DO UPDATE SET
                     sealed = excluded.sealed,
                     sealed_key = excluded.sealed_key,
@@ -251,7 +254,8 @@ export class SqliteStore implements VaultStore {
                     rotation = excluded.rotation,
                     rotated_at = excluded.rotated_at,
                     metadata = excluded.metadata,
-                    updated_at = excluded.updated_at`
+                    updated_at = excluded.updated_at,
+                    revision = excluded.revision`
             )
             .run(
                 record.owner,
@@ -267,12 +271,105 @@ export class SqliteStore implements VaultStore {
                 record.rotatedAt?.getTime() ?? null,
                 JSON.stringify(record.metadata),
                 record.createdAt.getTime(),
-                record.updatedAt.getTime()
+                record.updatedAt.getTime(),
+                record.revision ?? 1
             )
 
         const stored = await this.get(record.owner, record.name)
         if (!stored) throw new Error("The record vanished immediately after writing it.")
         return stored
+    }
+
+    /**
+     * Writes a record only if the stored one is still at `expectedRevision`.
+     *
+     * @remarks
+     * SQLite settles this in one statement — an `INSERT … WHERE NOT EXISTS` to
+     * claim a name, an `UPDATE … WHERE revision = ?` to replace a value — so
+     * two writers racing on one entry cannot both win. Within a process
+     * `bun:sqlite` is synchronous anyway; this is what makes it safe between
+     * processes sharing the file.
+     *
+     * @param record The record to write, revision already incremented.
+     * @param expectedRevision What the stored revision must be, or null to
+     *   require that nothing is stored under that name yet.
+     * @returns The written record, or null when the revision did not match.
+     */
+    async putIf(
+        record: SecretRecord,
+        expectedRevision: number | null
+    ): Promise<SecretRecord | null> {
+        const changed =
+            expectedRevision === null
+                ? this.claim(record)
+                : this.replace(record, expectedRevision)
+
+        return changed ? await this.get(record.owner, record.name) : null
+    }
+
+    /** Inserts a record, unless that name is taken. True if it went in. */
+    private claim(record: SecretRecord): boolean {
+        const result = this.db
+            .query(
+                `INSERT OR IGNORE INTO ${this.table}
+                    (owner, name, sealed, sealed_key, plain, is_sealed, is_final,
+                     expires_at, history, rotation, rotated_at, metadata,
+                     created_at, updated_at, revision)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            )
+            .run(...SqliteStore.bind(record))
+        return result.changes > 0
+    }
+
+    /** Replaces a record, but only at the revision given. True if it did. */
+    private replace(record: SecretRecord, expectedRevision: number): boolean {
+        const result = this.db
+            .query(
+                `UPDATE ${this.table} SET
+                    sealed = ?, sealed_key = ?, plain = ?, is_sealed = ?,
+                    is_final = ?, expires_at = ?, history = ?, rotation = ?,
+                    rotated_at = ?, metadata = ?, updated_at = ?, revision = ?
+                 WHERE owner = ? AND name = ? AND revision = ?`
+            )
+            .run(
+                record.sealed,
+                record.sealedKey,
+                record.plain,
+                record.isSealed ? 1 : 0,
+                record.isFinal ? 1 : 0,
+                record.expiresAt?.getTime() ?? null,
+                JSON.stringify(record.history),
+                record.rotation ? JSON.stringify(record.rotation) : null,
+                record.rotatedAt?.getTime() ?? null,
+                JSON.stringify(record.metadata),
+                record.updatedAt.getTime(),
+                record.revision ?? 1,
+                record.owner,
+                record.name,
+                expectedRevision
+            )
+        return result.changes > 0
+    }
+
+    /** A record as the insert's parameters, in column order. */
+    private static bind(record: SecretRecord): (string | number | null)[] {
+        return [
+            record.owner,
+            record.name,
+            record.sealed,
+            record.sealedKey,
+            record.plain,
+            record.isSealed ? 1 : 0,
+            record.isFinal ? 1 : 0,
+            record.expiresAt?.getTime() ?? null,
+            JSON.stringify(record.history),
+            record.rotation ? JSON.stringify(record.rotation) : null,
+            record.rotatedAt?.getTime() ?? null,
+            JSON.stringify(record.metadata),
+            record.createdAt.getTime(),
+            record.updatedAt.getTime(),
+            record.revision ?? 1,
+        ]
     }
 
     /**

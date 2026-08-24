@@ -1269,3 +1269,399 @@ test("a listing can be narrowed by metadata", async () => {
     expect(await names({ kind: "apiKey", env: "prod" })).toEqual(["one"])
     expect(await names({ kind: "nothing" })).toEqual([])
 })
+
+// --- revisions and concurrency --------------------------------------------
+
+test("every write advances the revision", async () => {
+    const first = await vault.put("alice", "token", "one")
+    expect(first.revision).toBe(1)
+
+    expect((await vault.put("alice", "token", "two")).revision).toBe(2)
+    expect((await vault.rotate("alice", "token", "three")).revision).toBe(3)
+    expect((await vault.list("alice"))[0]?.revision).toBe(3)
+})
+
+test("a write at the wrong revision is refused, and changes nothing", async () => {
+    const seen = await vault.put("alice", "token", "one")
+    await vault.put("alice", "token", "someone else's")
+
+    await expect(
+        vault.put("alice", "token", "mine", { expectedRevision: seen.revision })
+    ).rejects.toThrow(/has changed since revision 1/)
+
+    // The loser's value did not land.
+    expect(await vault.open("alice", "token")).toBe("someone else's")
+})
+
+test("a write at the right revision goes through", async () => {
+    const seen = await vault.put("alice", "token", "one")
+    await vault.put("alice", "token", "two", { expectedRevision: seen.revision })
+    expect(await vault.open("alice", "token")).toBe("two")
+})
+
+test("expectedRevision null claims a name only if it is free", async () => {
+    await vault.put("alice", "token", "mine", { expectedRevision: null })
+    expect(await vault.open("alice", "token")).toBe("mine")
+
+    await expect(
+        vault.put("alice", "token", "also mine", { expectedRevision: null })
+    ).rejects.toThrow(/already exists/)
+})
+
+test("a refused write is reported as denied", async () => {
+    const events: VaultEvent[] = []
+    const watched = new Vault({ key: KEY, store, onAccess: (event) => events.push(event) })
+
+    await watched.put("alice", "token", "one")
+    await expect(
+        watched.put("alice", "token", "two", { expectedRevision: 99 })
+    ).rejects.toThrow(VaultError)
+
+    expect(events.at(-1)).toMatchObject({ action: "denied", detail: "revision" })
+})
+
+test("strictWrites refuses a write that would clobber a change", async () => {
+    const strict = new Vault({ key: KEY, store, strictWrites: true })
+    await strict.put("alice", "token", "one")
+
+    // Two writers that both read revision 1 and then both write.
+    const results = await Promise.allSettled([
+        strict.put("alice", "token", "A", { expectedRevision: 1 }),
+        strict.put("alice", "token", "B", { expectedRevision: 1 }),
+    ])
+    expect(results.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"])
+})
+
+test("without strictWrites, a plain put still overwrites as it always did", async () => {
+    await vault.put("alice", "token", "one")
+    await vault.put("alice", "token", "two")
+    expect(await vault.open("alice", "token")).toBe("two")
+})
+
+test("a store with no putIf still gets checked, just less tightly", async () => {
+    // MemoryStore has putIf; this one deliberately does not, which is the
+    // fallback path a hand-rolled store lands on.
+    const plain: VaultStore = {
+        get: (owner, name) => store.get(owner, name),
+        list: (owner) => store.list(owner),
+        all: () => store.all(),
+        put: (record) => store.put(record),
+        remove: (owner, name) => store.remove(owner, name),
+    }
+    const fallback = new Vault({ key: KEY, store: plain })
+
+    await fallback.put("alice", "token", "one")
+    await fallback.put("alice", "token", "two", { expectedRevision: 1 })
+    expect(await fallback.open("alice", "token")).toBe("two")
+
+    await expect(
+        fallback.put("alice", "token", "three", { expectedRevision: 1 })
+    ).rejects.toThrow(/has changed/)
+})
+
+test("a record from before revisions counts on from 1", async () => {
+    const before: SecretRecord = {
+        owner: "alice",
+        name: "old",
+        sealed: await seal(await importKey(KEY), "value"),
+        sealedKey: null,
+        plain: null,
+        isSealed: true,
+        isFinal: false,
+        expiresAt: null,
+        history: [],
+        rotation: null,
+        rotatedAt: null,
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        // no revision at all, as an older store would have written it
+    }
+    await store.put(before)
+
+    expect((await vault.list("alice"))[0]?.revision).toBeUndefined()
+    // Read as 1, so the next write is 2 rather than 1 all over again.
+    expect((await vault.put("alice", "old", "next")).revision).toBe(2)
+})
+
+test("remove can insist on a revision", async () => {
+    await vault.put("alice", "token", "one")
+    await vault.put("alice", "token", "two")
+
+    await expect(vault.remove("alice", "token", { expectedRevision: 1 })).rejects.toThrow(
+        /has changed since revision 1/
+    )
+    expect(await vault.has("alice", "token")).toBe(true)
+
+    expect(await vault.remove("alice", "token", { expectedRevision: 2 })).toBe(true)
+})
+
+test("removing something already gone is fine, whatever revision was asked for", async () => {
+    expect(await vault.remove("alice", "absent", { expectedRevision: 7 })).toBe(false)
+})
+
+test("SqliteStore settles a contested write in the database", async () => {
+    const sqlite = new SqliteStore(":memory:")
+    const first = await sqlite.putIf(record("alice", "token", 1), null)
+    expect(first).not.toBeNull()
+
+    // The name is taken, so a second claim on it fails.
+    expect(await sqlite.putIf(record("alice", "token", 1), null)).toBeNull()
+
+    expect(await sqlite.putIf(record("alice", "token", 2), 1)).not.toBeNull()
+    expect(await sqlite.putIf(record("alice", "token", 3), 1)).toBeNull()
+    expect((await sqlite.get("alice", "token"))?.revision).toBe(2)
+    sqlite.close()
+})
+
+test("FileStore settles a contested write under its lock", async () => {
+    const file = new FileStore(path.join(dir, "contested.vault"), KEY)
+
+    expect(await file.putIf(record("alice", "token", 1), null)).not.toBeNull()
+    expect(await file.putIf(record("alice", "token", 1), null)).toBeNull()
+    expect(await file.putIf(record("alice", "token", 2), 1)).not.toBeNull()
+    expect(await file.putIf(record("alice", "token", 3), 1)).toBeNull()
+    expect((await file.get("alice", "token"))?.revision).toBe(2)
+})
+
+/** A minimal record, for testing a store directly. */
+function record(owner: string, name: string, revision: number): SecretRecord {
+    return {
+        owner,
+        name,
+        sealed: "iv:payload",
+        sealedKey: null,
+        plain: null,
+        isSealed: true,
+        isFinal: false,
+        expiresAt: null,
+        history: [],
+        rotation: null,
+        rotatedAt: null,
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        revision,
+    }
+}
+
+// --- the file lock --------------------------------------------------------
+
+test("two writers on one file both land, rather than one erasing the other", async () => {
+    const where = path.join(dir, "shared.vault")
+    // Two stores on one path, as two processes would be: neither can see the
+    // other's memory, so only the file and the lock keep them honest.
+    const one = new FileStore(where, KEY)
+    const two = new FileStore(where, KEY)
+
+    await Promise.all([
+        one.put(record("alice", "from-one", 1)),
+        two.put(record("alice", "from-two", 1)),
+    ])
+
+    one.forget()
+    expect((await one.list("alice")).map((entry) => entry.name).sort()).toEqual([
+        "from-one",
+        "from-two",
+    ])
+})
+
+test("a write waits for the lock rather than giving up at once", async () => {
+    const where = path.join(dir, "queued.vault")
+    const store = new FileStore(where, KEY)
+    await store.put(record("alice", "first", 1))
+
+    // Held by "another process": a lock file this store did not make.
+    const lock = path.join(dir, "queued.vault.lock")
+    await Bun.write(lock, "99999\n")
+
+    const writing = store.put(record("alice", "second", 1))
+    await Bun.sleep(30)
+    await rm(lock)
+
+    await writing
+    store.forget()
+    expect(await store.get("alice", "second")).not.toBeNull()
+})
+
+test("a lock nobody lets go of eventually fails the write", async () => {
+    const where = path.join(dir, "stuck.vault")
+    const store = new FileStore(where, KEY, { lockTimeout: 40, staleAfter: 60_000 })
+    await Bun.write(`${where}.lock`, "99999\n")
+
+    await expect(store.put(record("alice", "never", 1))).rejects.toThrow(/Timed out waiting/)
+})
+
+test("a lock left by something that died is broken and the write goes on", async () => {
+    const where = path.join(dir, "stale.vault")
+    // Anything older than a moment counts as abandoned here.
+    const store = new FileStore(where, KEY, { lockTimeout: 2_000, staleAfter: 1 })
+    await Bun.write(`${where}.lock`, "99999\n")
+    await Bun.sleep(10)
+
+    await store.put(record("alice", "after", 1))
+    expect(await store.get("alice", "after")).not.toBeNull()
+})
+
+test("destroying a store takes its lock file with it", async () => {
+    const where = path.join(dir, "gone.vault")
+    const store = new FileStore(where, KEY)
+    await store.put(record("alice", "here", 1))
+    await Bun.write(`${where}.lock`, "99999\n")
+
+    await store.destroy()
+    expect(await Bun.file(`${where}.lock`).exists()).toBe(false)
+})
+
+test("a failed write still lets go of the lock", async () => {
+    const where = path.join(dir, "broken.vault")
+    const store = new FileStore(where, "not-a-key")
+
+    await expect(store.put(record("alice", "x", 1))).rejects.toThrow(VaultKeyError)
+    // The next writer must not be locked out by the one that failed.
+    expect(await Bun.file(`${where}.lock`).exists()).toBe(false)
+})
+
+// --- rotating what is due -------------------------------------------------
+
+test("rotateDue rotates everything overdue and leaves the rest", async () => {
+    await vault.put("alice", "due", "old", { rotation: { kind: "random", length: 8, every: 1 } })
+    await vault.put("alice", "later", "old", {
+        rotation: { kind: "random", length: 8, every: 86_400 },
+    })
+    await vault.put("alice", "no-policy", "old")
+
+    await Bun.sleep(1100)
+    const report = await vault.rotateDue()
+
+    expect(report).toEqual({ rotated: ["alice/due"], failed: [] })
+    expect(await vault.open("alice", "due")).not.toBe("old")
+    expect(await vault.open("alice", "later")).toBe("old")
+    expect(await vault.open("alice", "no-policy")).toBe("old")
+})
+
+test("one entry that will not rotate does not stop the others", async () => {
+    await vault.put("alice", "broken", "old", {
+        rotation: { kind: "generator", generator: "absent", every: 1 },
+    })
+    await vault.put("alice", "fine", "old", { rotation: { kind: "random", length: 8, every: 1 } })
+
+    await Bun.sleep(1100)
+    const report = await vault.rotateDue()
+
+    expect(report.rotated).toEqual(["alice/fine"])
+    expect(report.failed).toHaveLength(1)
+    expect(report.failed[0]?.name).toBe("alice/broken")
+    expect(report.failed[0]?.reason).toMatch(/does not have/)
+})
+
+test("a generator that throws is reported, not swallowed", async () => {
+    const angry = new Vault({
+        key: KEY,
+        store,
+        generators: {
+            angry: () => {
+                throw new Error("the provider is down")
+            },
+        },
+    })
+    await angry.put("alice", "k", "old", {
+        rotation: { kind: "generator", generator: "angry", every: 1 },
+    })
+
+    await Bun.sleep(1100)
+    expect((await angry.rotateDue()).failed[0]?.reason).toBe("the provider is down")
+})
+
+// --- resolving nested configuration ---------------------------------------
+
+test("references resolve anywhere in a config, not only at the top", async () => {
+    await vault.put("alice", "db", "hunter2")
+    await vault.put("alice", "hook", "https://example.test/x")
+
+    expect(
+        await vault.resolve("alice", {
+            database: { host: "db.internal", password: "@vault:db" },
+            webhooks: [{ url: "@vault:hook" }, { url: "plain" }],
+            port: 5432,
+            tls: true,
+            nothing: null,
+        })
+    ).toEqual({
+        database: { host: "db.internal", password: "hunter2" },
+        webhooks: [{ url: "https://example.test/x" }, { url: "plain" }],
+        port: 5432,
+        tls: true,
+        nothing: null,
+    })
+})
+
+test("what is not configuration is passed through as itself", async () => {
+    const when = new Date()
+    const resolved = await vault.resolve("alice", { when, re: /x/ })
+    expect(resolved.when).toBe(when)
+})
+
+test("a nested branch with no references keeps its identity", async () => {
+    await vault.put("alice", "db", "hunter2")
+    const untouched = { host: "db.internal" }
+
+    const resolved = await vault.resolve("alice", {
+        kept: untouched,
+        changed: { password: "@vault:db" },
+    })
+    expect(resolved.kept).toBe(untouched)
+    expect(resolved.changed).not.toBe(untouched)
+})
+
+test("configuration that refers back to itself is refused", async () => {
+    const looping: Record<string, unknown> = { name: "x" }
+    looping.self = looping
+
+    await expect(vault.resolve("alice", looping)).rejects.toThrow(/refers back to itself/)
+})
+
+test("the same object twice over is repetition, not a loop", async () => {
+    await vault.put("alice", "db", "hunter2")
+    const shared = { password: "@vault:db" }
+
+    expect(await vault.resolve("alice", { one: shared, two: shared })).toEqual({
+        one: { password: "hunter2" },
+        two: { password: "hunter2" },
+    })
+})
+
+test("a bare string resolves on its own", async () => {
+    await vault.put("alice", "db", "hunter2")
+    expect(await vault.resolve("alice", "@vault:db")).toBe("hunter2")
+    expect(await vault.resolve("alice", "plain")).toBe("plain")
+})
+
+test("destroying a store that never wrote anything is not an error", async () => {
+    const store = new FileStore(path.join(dir, "never-written.vault"), KEY)
+    await expect(store.destroy()).resolves.toBeUndefined()
+})
+
+test("letting go of a lock that is already gone is not an error", async () => {
+    let release: () => void = () => {}
+    const held = new Promise<void>((resume) => {
+        release = resume
+    })
+
+    const where = path.join(dir, "vanishing.vault")
+    // The key is resolved inside the lock, so this holds the write open while
+    // the test takes the lock file away underneath it.
+    const store = new FileStore(where, {
+        key: async () => {
+            await held
+            return KEY
+        },
+    })
+
+    const writing = store.put(record("alice", "x", 1))
+    await Bun.sleep(20)
+    await rm(`${where}.lock`)
+    release()
+
+    await expect(writing).resolves.toBeDefined()
+})

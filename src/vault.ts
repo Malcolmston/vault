@@ -213,6 +213,48 @@ export type VaultOptions = {
      *   which arrive as `denied` with a `detail` saying which rule was hit.
      */
     onAccess?: (event: VaultEvent) => void
+    /**
+     * Refuse any write that would overwrite a change made since the vault last
+     * read the entry.
+     *
+     * @remarks
+     * Off by default, because it turns a write that used to succeed into a 409
+     * and vaults written against 1.1 should keep behaving as they did. Turn it
+     * on wherever more than one process writes the same store: without it, two
+     * writers racing on one entry silently lose one of the two values, and the
+     * loser is told the write succeeded.
+     *
+     * A single caller passing {@link PutOptions.expectedRevision} gets the same
+     * protection for that one call whatever this is set to.
+     *
+     * How airtight it is depends on the store — see {@link VaultStore.putIf}.
+     *
+     * @defaultValue false
+     */
+    strictWrites?: boolean
+}
+
+/** {@link PutOptions} plus what only the vault itself may set. */
+type InternalPutOptions = PutOptions & {
+    /** Stamped by {@link Vault.rotate}, so a rotation is one write and not two. */
+    rotatedAt?: Date
+}
+
+/**
+ * What a pass of {@link Vault.rotateDue} rotated, and what it could not.
+ *
+ * @see {@link Vault.rotateDue}
+ */
+export type RotateDueReport = {
+    /** Entries rotated, by `owner/name`. */
+    rotated: string[]
+    /** Entries that would not rotate, left exactly as they were. */
+    failed: {
+        /** Which entry, as `owner/name`. */
+        name: string
+        /** What went wrong, as the error said it. */
+        reason: string
+    }[]
 }
 
 /**
@@ -300,6 +342,7 @@ export class Vault {
     private readonly historyLimit: number
     private readonly generators: Record<string, Generator>
     private readonly onAccess: ((event: VaultEvent) => void) | undefined
+    private readonly strictWrites: boolean
     /** The prefix {@link Vault.resolve} treats as a reference. */
     readonly prefix: string
 
@@ -317,6 +360,7 @@ export class Vault {
         historyLimit = DEFAULT_HISTORY_LIMIT,
         generators = {},
         onAccess,
+        strictWrites = false,
     }: VaultOptions) {
         this.keySource = key
         this.previousSources = previousKeys
@@ -325,6 +369,7 @@ export class Vault {
         this.historyLimit = historyLimit
         this.generators = generators
         this.onAccess = onAccess
+        this.strictWrites = strictWrites
     }
 
     private master(): Promise<CryptoKey> {
@@ -475,6 +520,10 @@ export class Vault {
         value: string,
         options: PutOptions = {}
     ): Promise<SecretSummary> {
+        // `rotate` stamps through here rather than writing a second time: two
+        // writes would advance the revision twice for one logical change, and
+        // the second one would not be guarded by anything.
+        const { rotatedAt } = options as InternalPutOptions
         const clean = this.checkName(name)
         if (!value) throw new VaultError("A secret needs a value.")
 
@@ -508,7 +557,7 @@ export class Vault {
             ? { ...(await this.enseal(value)), plain: null }
             : { sealed: "", sealedKey: null, plain: value }
 
-        const stored = await this.store.put({
+        const record = {
             owner,
             name: clean,
             ...body,
@@ -518,7 +567,7 @@ export class Vault {
                 options.rotation === undefined
                     ? (existing?.rotation ?? null)
                     : options.rotation,
-            rotatedAt: existing?.rotatedAt ?? null,
+            rotatedAt: rotatedAt ?? existing?.rotatedAt ?? null,
             expiresAt:
                 options.expiresAt === undefined
                     ? (existing?.expiresAt ?? null)
@@ -527,10 +576,68 @@ export class Vault {
             metadata: options.metadata ?? existing?.metadata ?? {},
             createdAt: existing?.createdAt ?? now,
             updatedAt: now,
-        })
+            // A record from before revisions reads as 1, so it must be written
+            // back as 2 — counting from 0 would leave it stuck at 1 forever.
+            revision: (existing ? (existing.revision ?? 1) : 0) + 1,
+        }
 
+        const stored = await this.write(record, existing, options.expectedRevision)
         this.record({ action: "put", owner, name: clean })
         return summarise(stored)
+    }
+
+    /**
+     * Writes a record, comparing revisions first when anything asked us to.
+     *
+     * @param record The record to write, revision already incremented.
+     * @param existing What was read a moment ago, or null.
+     * @param expected What the caller demanded the revision be, if anything.
+     * @returns The stored record.
+     * @throws {@link VaultError} 409 when the entry is not at the revision it
+     *   was supposed to be.
+     */
+    private async write(
+        record: SecretRecord,
+        existing: SecretRecord | null,
+        expected: number | null | undefined
+    ): Promise<SecretRecord> {
+        // Nothing to compare against: the caller did not ask, and this vault
+        // was not told to insist. 1.1 and earlier behaviour, exactly.
+        if (expected === undefined && !this.strictWrites) {
+            return this.store.put(record)
+        }
+
+        // Left to ourselves, we guard against whatever we just read — which is
+        // what makes a lost update impossible rather than merely unlikely.
+        const against =
+            expected === undefined ? (existing ? (existing.revision ?? 1) : null) : expected
+
+        if (this.store.putIf) {
+            const stored = await this.store.putIf(record, against)
+            if (stored) return stored
+        } else {
+            // No atomic path. Re-read as late as we can and compare: the window
+            // is smaller than doing nothing, and it is the best a store that
+            // cannot compare-and-set can offer.
+            const current = await this.store.get(record.owner, record.name)
+            const now = current ? (current.revision ?? 1) : null
+            if (now === against) {
+                return this.store.put(record)
+            }
+        }
+
+        this.record({
+            action: "denied",
+            owner: record.owner,
+            name: record.name,
+            detail: "revision",
+        })
+        throw new VaultError(
+            against === null
+                ? `"${record.name}" already exists.`
+                : `"${record.name}" has changed since revision ${against}.`,
+            409
+        )
     }
 
     /**
@@ -583,13 +690,11 @@ export class Vault {
         const next = value ?? (await this.generate(owner, clean))
 
         this.record({ action: "rotate", owner, name: clean })
-        const summary = await this.put(owner, clean, next, { ...options, keepHistory: true })
-
-        // Stamped after the fact, so a failed rotation does not look like one.
-        const rotatedAt = new Date()
-        const stored = await this.store.get(owner, clean)
-        if (stored) await this.store.put({ ...stored, rotatedAt })
-        return { ...summary, rotatedAt }
+        return this.put(owner, clean, next, {
+            ...options,
+            keepHistory: true,
+            rotatedAt: new Date(),
+        } as InternalPutOptions)
     }
 
     /** The next value an entry's policy calls for. */
@@ -655,6 +760,50 @@ export class Vault {
     }
 
     /**
+     * Rotates everything a policy says is overdue.
+     *
+     * @remarks
+     * The companion to {@link Vault.rotationDue}, which only tells you. Run it
+     * on a schedule and credentials rotate themselves — which is the whole
+     * point of an entry carrying a policy rather than a person remembering.
+     *
+     * One entry that will not rotate does not stop the others. A generator that
+     * throws, an entry gone final, a policy naming a generator this vault does
+     * not have: each is caught, named in `failed` with what went wrong, and the
+     * run carries on. A rotation pass that abandoned the remaining credentials
+     * because one provider was down would be worse than useless.
+     *
+     * @param now What to treat as the current time, for testing.
+     * @returns What rotated, and what would not.
+     *
+     * @example
+     * ```ts
+     * const { rotated, failed } = await vault.rotateDue()
+     * for (const { name, reason } of failed) console.warn(name, reason)
+     * ```
+     *
+     * @see {@link Vault.rotationDue} to see what is overdue without acting.
+     */
+    async rotateDue(now = new Date()): Promise<RotateDueReport> {
+        const report: RotateDueReport = { rotated: [], failed: [] }
+
+        for (const due of await this.rotationDue(now)) {
+            const where = `${due.owner}/${due.name}`
+            try {
+                await this.rotate(due.owner, due.name)
+                report.rotated.push(where)
+            } catch (error) {
+                report.failed.push({
+                    name: where,
+                    reason: error instanceof Error ? error.message : String(error),
+                })
+            }
+        }
+
+        return report
+    }
+
+    /**
      * Previous values of an entry, newest first, opened.
      *
      * @param owner Whose entry it is.
@@ -711,9 +860,32 @@ export class Vault {
      * @remarks
      * Deleting takes the kept previous values with it, and it is the one thing
      * a `final` entry allows.
+     * @param options `expectedRevision` refuses the delete unless the entry
+     *   is still at that revision — for deleting something you just looked at
+     *   and do not want to delete a newer version of. It is read-then-delete
+     *   rather than one atomic step, so it narrows the window without closing
+     *   it; a delete is easier to live with than a lost write, which is why
+     *   this does not have the store-level guarantee `put` does.
      */
-    async remove(owner: string, name: string): Promise<boolean> {
-        const removed = await this.store.remove(owner, this.checkName(name))
+    async remove(
+        owner: string,
+        name: string,
+        { expectedRevision }: { expectedRevision?: number } = {}
+    ): Promise<boolean> {
+        const clean = this.checkName(name)
+
+        if (expectedRevision !== undefined) {
+            const current = await this.store.get(owner, clean)
+            if (current && (current.revision ?? 1) !== expectedRevision) {
+                this.record({ action: "denied", owner, name: clean, detail: "revision" })
+                throw new VaultError(
+                    `"${clean}" has changed since revision ${expectedRevision}.`,
+                    409
+                )
+            }
+        }
+
+        const removed = await this.store.remove(owner, clean)
         if (removed) this.record({ action: "remove", owner, name })
         return removed
     }
@@ -808,16 +980,23 @@ export class Vault {
      * A reference to a secret that isn't there, or that has expired, throws:
      * running with a blank credential is worse than not running.
      *
+     * @typeParam T The shape passed in, which is the shape handed back.
      * @param owner Whose entries the references name.
      * @param values The set to substitute into. Not modified.
-     * @returns A copy with every reference replaced by its value, or the same
-     *   object back when nothing in it is a reference.
+     * @returns A copy with every reference replaced by its value. Anything
+     *   holding no references at all is handed straight back, not copied.
      * @throws {@link VaultError} 404 when a reference names no entry.
      * @throws {@link VaultError} 410 when a referenced entry has expired.
      * @throws {@link VaultError} 422 when what follows the prefix is not a
-     *   legal name.
+     *   legal name, or the structure refers back to itself.
      *
      * @remarks
+     * Nested objects and arrays are walked, so a reference works anywhere in a
+     * config file rather than only at the top level. Anything that is not a
+     * string, a plain object or an array is passed through untouched — a Date
+     * or a class instance comes out the far side as itself, not as a bag of
+     * fields.
+     *
      * Whitespace around the name is ignored, so `"@vault: token "` finds
      * `token`. Sealed and open entries both resolve; the prefix comes from
      * {@link Vault.prefix}.
@@ -832,21 +1011,82 @@ export class Vault {
      * })
      * // { PLAIN: "kept", API_TOKEN: "secret" }
      * ```
+     *
+     * @example Anywhere in a config, not only at the top
+     * ```ts
+     * await vault.resolve("alice", {
+     *     database: { host: "db.internal", password: "@vault:db" },
+     *     webhooks: [{ url: "@vault:hook" }],
+     * })
+     * ```
      */
-    async resolve(
-        owner: string,
-        values: Record<string, string>
-    ): Promise<Record<string, string>> {
-        const references = Object.entries(values).filter(([, value]) =>
-            value.startsWith(this.prefix)
-        )
-        if (references.length === 0) return values
+    async resolve<T>(owner: string, values: T): Promise<T> {
+        return (await this.substitute(owner, values, new WeakSet())) as T
+    }
 
-        const resolved = { ...values }
-        for (const [key, value] of references) {
-            resolved[key] = await this.open(owner, value.slice(this.prefix.length).trim())
+    /**
+     * Walks a value, swapping references for secrets as it goes.
+     *
+     * @param owner Whose secrets a reference may name.
+     * @param value The value to walk: a string, an array, a plain object, or
+     *   anything else, which is returned untouched.
+     * @param seen Objects already on the path here, to catch a cycle rather
+     *   than following it forever.
+     * @returns The value with every reference in it replaced.
+     * @throws {@link VaultError} 422 when the structure refers back to itself.
+     */
+    private async substitute(
+        owner: string,
+        value: unknown,
+        seen: WeakSet<object>
+    ): Promise<unknown> {
+        if (typeof value === "string") {
+            return value.startsWith(this.prefix)
+                ? this.open(owner, value.slice(this.prefix.length).trim())
+                : value
         }
-        return resolved
+
+        if (value === null || typeof value !== "object") return value
+
+        // Dates, buffers, class instances: things that are objects but are not
+        // configuration, and would come out the far side mangled.
+        if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype) {
+            return value
+        }
+
+        if (seen.has(value)) {
+            throw new VaultError("That configuration refers back to itself.")
+        }
+        seen.add(value)
+
+        try {
+            // Rebuilt only if something in it actually changed, so a config
+            // with no references in it comes back as the object handed over
+            // rather than as a copy of it.
+            let changed = false
+
+            if (Array.isArray(value)) {
+                const out = []
+                for (const item of value) {
+                    const next = await this.substitute(owner, item, seen)
+                    changed ||= next !== item
+                    out.push(next)
+                }
+                return changed ? out : value
+            }
+
+            const out: Record<string, unknown> = {}
+            for (const [key, item] of Object.entries(value)) {
+                const next = await this.substitute(owner, item, seen)
+                changed ||= next !== item
+                out[key] = next
+            }
+            return changed ? out : value
+        } finally {
+            // Off the path again: the same object appearing twice side by side
+            // is repetition, not a cycle, and must still resolve.
+            seen.delete(value)
+        }
     }
 
     /**

@@ -213,6 +213,23 @@ export type SecretRecord = {
     createdAt: Date
     /** When it last changed. */
     updatedAt: Date
+    /**
+     * How many times the entry has been written, starting at 1.
+     *
+     * @remarks
+     * The handle for optimistic concurrency: read an entry, and pass the
+     * revision you saw back as {@link PutOptions.expectedRevision} to have the
+     * write refused if anything changed in between.
+     *
+     * Optional, and read as 1 when absent, so that a store written against an
+     * earlier version keeps compiling and keeps working. A record that predates
+     * 1.2.0 therefore reads back as revision 1 whatever it has actually been
+     * through — which only misleads a caller who read one before the upgrade
+     * and wrote after it.
+     *
+     * @defaultValue 1
+     */
+    revision?: number
 }
 
 /**
@@ -330,6 +347,26 @@ export type PutOptions = {
      * @defaultValue false
      */
     keepHistory?: boolean
+    /**
+     * Refuse the write unless the entry is still at this revision.
+     *
+     * @remarks
+     * Optimistic concurrency: read an entry, decide what its next value should
+     * be, and pass the {@link SecretRecord.revision} you based that on. If
+     * someone else wrote in the meantime the entry is at a different revision
+     * and the write throws 409 rather than quietly overwriting them.
+     *
+     * Pass `null` to mean "only if it does not exist yet" — the way to claim a
+     * name without racing another writer for it.
+     *
+     * How airtight this is depends on the store. `PostgresStore` and
+     * `SqliteStore` settle it in one statement; a store that does not implement
+     * {@link VaultStore.putIf} gets a check-then-write, which narrows the race
+     * without closing it.
+     *
+     * @defaultValue undefined — write regardless of what is there
+     */
+    expectedRevision?: number | null
 }
 
 /**
@@ -388,6 +425,31 @@ export type VaultStore = {
      * @returns True when a record went, false when there was none.
      */
     remove(owner: string, name: string): Promise<boolean>
+    /**
+     * Writes a record only if the stored one is still at `expectedRevision`,
+     * in a single atomic step. Optional.
+     *
+     * @remarks
+     * Implement this if the underlying database can compare and set in one
+     * statement — a `WHERE revision = ?` on an `UPDATE`, or the equivalent.
+     * Without it the vault falls back to reading and then writing, which leaves
+     * a window between the two.
+     *
+     * The vault handles the revision bookkeeping: `record.revision` arrives
+     * already incremented, and nothing here needs to work out what it should
+     * be.
+     *
+     * @param record The record to write, revision included.
+     * @param expectedRevision The revision the caller believes is stored, or
+     *   null to mean the entry must not exist yet.
+     * @returns The written record, or null when the stored revision did not
+     *   match — which the vault turns into a 409. Returning null is not an
+     *   error and must not throw.
+     */
+    putIf?(
+        record: SecretRecord,
+        expectedRevision: number | null
+    ): Promise<SecretRecord | null>
 }
 
 /**

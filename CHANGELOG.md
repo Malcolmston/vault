@@ -8,6 +8,53 @@ repository was created — the code they point at is the 0.5.4-era tree, not the
 source those versions were built from. Use them to find the notes, not to read
 the code; the published tarballs on npm are the real artifacts.
 
+## 1.2.0 — 2026-08-24
+
+Additive. The release that makes the vault safe to run from more than one
+process, which is what the README always claimed it was for.
+
+### Added
+
+- **Optimistic concurrency.** Every entry carries a `revision` that advances on
+  each write. Pass the one you read back as `expectedRevision` and a write that
+  would land on top of someone else's throws 409 instead of overwriting it;
+  `{ expectedRevision: null }` claims a name only if it is free. `remove` takes
+  it too, as a read-then-delete.
+- **`strictWrites`** applies that to every write without passing it each time.
+  Off by default, because it turns a write that used to succeed into a 409 and
+  1.1's behaviour has to keep working.
+- **`VaultStore.putIf`**, optional, for stores that can compare and set in one
+  statement. `PostgresStore` and `SqliteStore` implement it, so a contested
+  write is settled by the database; `FileStore` settles it under its lock. A
+  store without it falls back to check-then-write, which narrows the window
+  rather than closing it — nothing breaks, and the README says which store
+  gives which guarantee.
+- **`PostgresStore`**, behind `@mstone6969/vault/stores/postgres`. The first
+  store that several processes can share safely. Bun-only, like `SqliteStore`.
+  Call `migrate()` once before first use; it is not run for you.
+- **`FileStore` now locks.** Writes take a lock file and re-read the file while
+  holding it, so two processes on one path queue up instead of overwriting each
+  other. A lock older than `staleAfter` is broken, so a crash does not lock
+  everyone out forever. `lockTimeout` and `staleAfter` are constructor options.
+- **`rotateDue()`** rotates everything a policy says is overdue — the companion
+  to `rotationDue()`, which only ever told you. One entry that will not rotate
+  is named in the report and the rest still go.
+- **`resolve` walks nested structures.** A `@vault:` reference now works
+  anywhere in a config object or array, not only at the top level. Anything
+  that is not a string, plain object or array is passed through as itself, and
+  a branch holding no references is handed back rather than copied.
+
+### Fixed
+
+- `rotate` wrote twice — once for the value, once to stamp `rotatedAt` — and
+  the second write was guarded by nothing. Under `strictWrites` a concurrent
+  writer could be clobbered by that stamp. It is one write now, so a rotation
+  advances the revision once rather than twice.
+- Coverage was reported but never enforced: `test:coverage` was
+  `bun test --coverage`, which exits 0 whatever the numbers say, so CI would
+  have gone green on a regression. It now parses the lcov report and fails
+  below 100%, and that failure has been demonstrated rather than assumed.
+
 ## 1.1.0 — 2026-08-23
 
 Additive. Nothing published before this keeps working differently.

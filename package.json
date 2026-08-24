@@ -1,6 +1,6 @@
 {
   "name": "@mstone6969/vault",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A write-only credential vault: envelope encryption, key rotation, expiry, history and an encrypted single-file store.",
   "type": "module",
   "license": "MIT",
@@ -44,6 +44,10 @@
       "types": "./dist/stores/sqlite.d.ts",
       "import": "./dist/stores/sqlite.js"
     },
+    "./stores/postgres": {
+      "types": "./dist/stores/postgres.d.ts",
+      "import": "./dist/stores/postgres.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -65,7 +69,7 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "bun run typecheck && bun run docs:check && bun run test:coverage && bun run build && bun run docs",
-    "test:coverage": "bun test --coverage",
+    "test:coverage": "bun run scripts/coverage.ts",
     "docs": "typedoc",
     "docs:check": "typedoc --emit none"
   },

@@ -1,4 +1,4 @@
-import { open as openFile, readFile, rename, unlink } from "node:fs/promises"
+import { open as openFile, readFile, rename, stat, unlink } from "node:fs/promises"
 import { importKey, open, seal } from "../crypto"
 import { VaultKeyError } from "../errors"
 import { isKeyProvider, staticKey, type KeyProvider } from "../providers"
@@ -6,6 +6,29 @@ import type { SecretRecord, VaultStore } from "../types"
 
 /** What a vault file starts with, so a wrong file is refused, not parsed. */
 const MAGIC = "VAULT1"
+
+/** What a {@link FileStore} may be told beyond its path and key. */
+export type FileStoreOptions = {
+    /**
+     * How long to wait for another process to finish writing, in milliseconds,
+     * before giving up on a write.
+     *
+     * @defaultValue 5000
+     */
+    lockTimeout?: number
+    /**
+     * How old a lock file must be, in milliseconds, before it is taken as
+     * abandoned and broken.
+     *
+     * @remarks
+     * The floor on how long a crash locks the store out. Too low and a slow
+     * write gets its lock broken underneath it; too high and a crash costs
+     * everyone that long.
+     *
+     * @defaultValue 30000
+     */
+    staleAfter?: number
+}
 
 /**
  * Keeps every record in one encrypted file.
@@ -33,10 +56,17 @@ const MAGIC = "VAULT1"
  * when a record is actually wanted. A bad key surfaces from that first
  * operation as a {@link VaultKeyError}, not from `new`.
  *
- * Nothing here locks the file. Two stores writing the same path — two
- * processes, or two instances in one — each hold their own copy of the index
- * and write it whole, so the last save wins and the other's writes are gone.
- * Keep one writer per file.
+ * Writes take a lock file beside the store and re-read the file while holding
+ * it, so two processes on the same path do not overwrite each other — the
+ * second waits for the first and then saves on top of what it actually wrote.
+ * Reads are not locked and are served from memory, so another process's writes
+ * stay invisible until {@link FileStore.forget}.
+ *
+ * A lock older than `staleAfter` is taken as abandoned and broken, which is
+ * what stops a crash locking everyone out forever. It is also the one hole in
+ * the scheme: a write that somehow takes longer than that can have its lock
+ * broken underneath it. Raise `staleAfter` if your disk is slow enough to
+ * worry, or reach for `PostgresStore`, where the database settles it.
  *
  * @example
  * A vault whose names are as hidden as its values. The store's key opens the
@@ -61,6 +91,12 @@ export class FileStore implements VaultStore {
     /** Resolved on first read or write, not at construction. */
     private keyCache: Promise<CryptoKey> | null = null
     private records: Map<string, SecretRecord> | null = null
+    private readonly lockPath: string
+    private readonly lockTimeout: number
+    private readonly staleAfter: number
+    /** Held while this process is inside a write, so its own calls queue up
+     * rather than fighting each other for the file lock. */
+    private queue: Promise<unknown> = Promise.resolve()
 
     /**
      * @param path Where to keep the file. Created on first write, so a path
@@ -78,9 +114,98 @@ export class FileStore implements VaultStore {
      * const store = new FileStore("./secrets.vault", generateKey())
      * ```
      */
-    constructor(path: string, key: string | CryptoKey | KeyProvider) {
+    constructor(
+        path: string,
+        key: string | CryptoKey | KeyProvider,
+        { lockTimeout = 5_000, staleAfter = 30_000 }: FileStoreOptions = {}
+    ) {
         this.path = path
         this.keySource = key
+        this.lockPath = `${path}.lock`
+        this.lockTimeout = lockTimeout
+        this.staleAfter = staleAfter
+    }
+
+    /**
+     * Runs a write with the file locked, and with whatever another process
+     * wrote in the meantime read back first.
+     *
+     * @remarks
+     * Both halves matter. The lock stops two processes writing at once; the
+     * re-read stops this one saving an index it loaded before the other
+     * process changed it, which would put back everything they deleted. A lock
+     * without the re-read would be theatre.
+     *
+     * Calls from this process are queued rather than made to contend for the
+     * lock file, so a burst of writes here does not spend its time backing off.
+     *
+     * @param work What to do while holding it.
+     * @returns Whatever `work` returned.
+     * @throws When the lock cannot be taken within `lockTimeout`.
+     */
+    private async locked<T>(work: () => Promise<T>): Promise<T> {
+        // The queue is always an already-caught promise, so waiting on it never
+        // rejects and one failed write does not poison the ones behind it.
+        const mine = this.queue.then(() => this.enter(work))
+        this.queue = mine.catch(() => {})
+        return mine
+    }
+
+    /** Takes the lock, drops the stale cache, runs the work, lets go. */
+    private async enter<T>(work: () => Promise<T>): Promise<T> {
+        await this.acquire()
+        try {
+            // Another process may have rewritten the file since we last read
+            // it. Whatever we have in memory is not to be trusted here.
+            this.records = null
+            return await work()
+        } finally {
+            await unlink(this.lockPath).catch(() => {
+                // Already gone: someone broke it as stale. Nothing to undo.
+            })
+        }
+    }
+
+    /** Creates the lock file, waiting for whoever holds it, breaking it if
+     * they appear to have died. */
+    private async acquire(): Promise<void> {
+        const deadline = Date.now() + this.lockTimeout
+
+        for (;;) {
+            try {
+                const handle = await openFile(this.lockPath, "wx")
+                await handle.writeFile(`${process.pid}\n`)
+                await handle.close()
+                return
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+                if (await this.breakIfStale()) continue
+                if (Date.now() >= deadline) {
+                    throw new Error(
+                        `Timed out waiting for ${this.lockPath}. Another process is writing to ` +
+                            `${this.path}, or one died holding the lock — delete the lock file if so.`
+                    )
+                }
+                await new Promise((resume) => setTimeout(resume, 20))
+            }
+        }
+    }
+
+    /**
+     * Removes a lock file old enough that whoever made it is presumed gone.
+     *
+     * @returns Whether one was broken, in which case it is worth trying again.
+     */
+    private async breakIfStale(): Promise<boolean> {
+        try {
+            const held = await stat(this.lockPath)
+            if (Date.now() - held.mtimeMs < this.staleAfter) return false
+            await unlink(this.lockPath)
+            return true
+        } catch {
+            // Gone while we looked at it, which is as good as breaking it.
+            return true
+        }
     }
 
     private key(): Promise<CryptoKey> {
@@ -251,6 +376,39 @@ export class FileStore implements VaultStore {
      *   resolved.
      */
     async put(record: SecretRecord): Promise<SecretRecord> {
+        return this.locked(() => this.write(record))
+    }
+
+    /**
+     * Writes a record only if the stored one is still at `expectedRevision`.
+     *
+     * @remarks
+     * The comparison happens under the file lock, against the file as it is on
+     * disk rather than as this process last saw it — so it holds between
+     * processes, which is the only situation where it matters here.
+     *
+     * @param record The record to write, revision already incremented.
+     * @param expectedRevision What the stored revision must be, or null to
+     *   require that nothing is stored under that name yet.
+     * @returns The written record, or null when the revision did not match.
+     * @throws {@link VaultKeyError} if the file cannot be opened.
+     */
+    async putIf(
+        record: SecretRecord,
+        expectedRevision: number | null
+    ): Promise<SecretRecord | null> {
+        return this.locked(async () => {
+            const records = await this.load()
+            const current = records.get(FileStore.id(record.owner, record.name))
+            const revision = current ? (current.revision ?? 1) : null
+            if (revision !== expectedRevision) return null
+            return this.write(record)
+        })
+    }
+
+    /** Sets a record and saves, putting the index back if the save fails.
+     * Assumes the lock is already held. */
+    private async write(record: SecretRecord): Promise<SecretRecord> {
         const records = await this.load()
         const id = FileStore.id(record.owner, record.name)
         const displaced = records.get(id)
@@ -278,19 +436,21 @@ export class FileStore implements VaultStore {
      * @throws {@link VaultKeyError} if the file cannot be opened.
      */
     async remove(owner: string, name: string): Promise<boolean> {
-        const records = await this.load()
-        const id = FileStore.id(owner, name)
-        const removed = records.get(id)
-        if (!removed) return false
+        return this.locked(async () => {
+            const records = await this.load()
+            const id = FileStore.id(owner, name)
+            const removed = records.get(id)
+            if (!removed) return false
 
-        records.delete(id)
-        try {
-            await this.save()
-        } catch (error) {
-            records.set(id, removed)
-            throw error
-        }
-        return true
+            records.delete(id)
+            try {
+                await this.save()
+            } catch (error) {
+                records.set(id, removed)
+                throw error
+            }
+            return true
+        })
     }
 
     /**
@@ -326,8 +486,13 @@ export class FileStore implements VaultStore {
      */
     async destroy(): Promise<void> {
         this.records = new Map()
-        await unlink(this.path).catch(() => {
-            // Already gone is the outcome we wanted.
-        })
+        await Promise.all([
+            unlink(this.path).catch(() => {
+                // Already gone is the outcome we wanted.
+            }),
+            // A lock left behind by a crash would otherwise outlive the file it
+            // was protecting, and lock out a store rebuilt on the same path.
+            unlink(this.lockPath).catch(() => {}),
+        ])
     }
 }

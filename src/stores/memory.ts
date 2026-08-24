@@ -124,6 +124,30 @@ export class MemoryStore implements VaultStore {
     }
 
     /**
+     * Writes a record only if the stored one is still at `expectedRevision`.
+     *
+     * @remarks
+     * A Map lives in one process and JavaScript does not interrupt this
+     * between the read and the write, so the comparison here is genuinely
+     * atomic — it just cannot help you across processes, because nothing else
+     * can see this store anyway.
+     *
+     * @param record The record to write, revision already incremented.
+     * @param expectedRevision What the stored revision must be, or null to
+     *   require that nothing is stored under that name yet.
+     * @returns The written record, or null when the revision did not match.
+     */
+    async putIf(
+        record: SecretRecord,
+        expectedRevision: number | null
+    ): Promise<SecretRecord | null> {
+        const current = this.records.get(MemoryStore.key(record.owner, record.name))
+        const revision = current ? (current.revision ?? 1) : null
+        if (revision !== expectedRevision) return null
+        return this.put(record)
+    }
+
+    /**
      * Deletes a record, returning false when there was nothing to delete.
      *
      * @param owner Whose entry to delete.

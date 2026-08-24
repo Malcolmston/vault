@@ -40,6 +40,26 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+
+    env:
+      # The gates below include PostgresStore's tests, which skip without a
+      # database — and a release must not skip a gate.
+      VAULT_TEST_DATABASE_URL: postgres://postgres:vault@localhost:5432/vault_test
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: vault
+          POSTGRES_DB: vault_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2

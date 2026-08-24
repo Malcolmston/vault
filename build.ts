@@ -5,9 +5,10 @@
  * subpath re-exports from it so there is one copy of each class — two bundles
  * would mean two `VaultError`s and a failing `instanceof`.
  *
- * SqliteStore is built separately because it imports `bun:sqlite`: keeping it
- * out of the root bundle is what lets Node import this package at all. Its
- * bundle shares nothing but erased types, so there is nothing to duplicate.
+ * SqliteStore and PostgresStore are built separately because they import
+ * Bun builtins — `bun:sqlite` and `bun` — and keeping those out of the root
+ * bundle is what lets Node import this package at all. Their bundles share
+ * nothing but erased types, so there is nothing to duplicate.
  */
 import { mkdir, rm } from "node:fs/promises"
 
@@ -57,6 +58,21 @@ const sqlite = await Bun.build({
 
 if (!sqlite.success) {
     for (const log of sqlite.logs) console.error(log)
+    process.exit(1)
+}
+
+const postgres = await Bun.build({
+    entrypoints: ["src/stores/postgres.ts"],
+    outdir: "dist/stores",
+    target: "bun",
+    format: "esm",
+    sourcemap: "linked",
+    // `bun` is the runtime itself, and holds the SQL client.
+    external: ["bun", "bun:sqlite"],
+})
+
+if (!postgres.success) {
+    for (const log of postgres.logs) console.error(log)
     process.exit(1)
 }
 
@@ -113,11 +129,14 @@ if ((await smoke.open("build", "check")) !== "value") {
     process.exit(1)
 }
 
-// Neither root bundle may pull in bun:*, which Node cannot resolve.
+// Neither root bundle may pull in a Bun builtin, which Node cannot resolve.
 for (const entry of ["dist/index.js", "dist/index.cjs"]) {
-    if ((await Bun.file(entry).text()).includes("bun:sqlite")) {
-        console.error(`${entry} pulls in bun:sqlite; Node could not load it.`)
-        process.exit(1)
+    const text = await Bun.file(entry).text()
+    for (const builtin of ["bun:sqlite", 'from "bun"', 'require("bun")']) {
+        if (text.includes(builtin)) {
+            console.error(`${entry} pulls in ${builtin}; Node could not load it.`)
+            process.exit(1)
+        }
     }
 }
 

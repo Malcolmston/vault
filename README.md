@@ -88,13 +88,27 @@ await vault.resolve("alice", {
 // { NODE_ENV: "production", API_KEY: "sk_live_…" }
 ```
 
+References work anywhere in a structure, not only at the top:
+
+```ts
+await vault.resolve("alice", {
+    database: { host: "db.internal", password: "@vault:db" },
+    webhooks: [{ url: "@vault:hook" }],
+})
+```
+
+Objects and arrays are walked; anything else — a number, a Date, a class
+instance — is passed through as itself. A branch containing no references at
+all is handed back rather than copied.
+
 A reference to a secret that isn't there **throws**. Running a job with a blank
 credential is worse than not running it. Change the prefix with
 `new Vault({ …, prefix: "secret://" })`.
 
 ## Storage
 
-Three stores ship with the package.
+Four stores ship with the package. If more than one process writes the same
+vault, use `PostgresStore` — see [More than one writer](#more-than-one-writer).
 
 **`FileStore`** keeps everything in one encrypted file. The other stores seal
 values and leave the rest in the open — SQLite has an `owner` column and a
@@ -115,8 +129,9 @@ secrets and one writer, not millions and many.
 Writes go to a temporary file, are flushed to disk, and are renamed into place,
 so neither a crash nor a power loss leaves a half-written index — which matters
 more here than elsewhere, because the whole index is one envelope and a torn
-file would lose every record rather than one. Nothing locks the file, so two
-writers on the same path are still last-write-wins. Unlike `SqliteStore`, it
+file would lose every record rather than one. Writes also take a lock file
+beside the store and re-read the file while holding it, so two processes on the
+same path queue up instead of overwriting each other. Unlike `SqliteStore`, it
 uses only `node:fs`, so it runs on Node as well as Bun.
 
 **`MemoryStore`** ships in the main entry. **`SqliteStore`** is Bun-only — it
@@ -128,6 +143,20 @@ import { SqliteStore } from "@mstone6969/vault/stores/sqlite"
 
 const store = new SqliteStore("./vault.sqlite") // or ":memory:", or a Database
 ```
+
+**`PostgresStore`** is the one to reach for when several processes share a
+vault. It is Bun-only too, since it uses Bun's built-in `SQL`:
+
+```ts
+import { PostgresStore } from "@mstone6969/vault/stores/postgres"
+
+const store = new PostgresStore(process.env.DATABASE_URL!)
+await store.migrate() // once, before first use
+```
+
+`migrate` is not run for you, because a library should not create tables behind
+your back the first time you read from it. It is safe to call on every start,
+and from several processes at once.
 
 Everything else runs on Node 18+ as well as Bun.
 
@@ -146,6 +175,8 @@ type VaultStore = {
         metadata: Record<string, string>
     }): Promise<SecretRecord>
     remove(owner: string, name: string): Promise<boolean>
+    // Optional. Without it you get a weaker guarantee, not an error.
+    putIf?(record: SecretRecord, expectedRevision: number | null): Promise<SecretRecord | null>
 }
 ```
 
@@ -213,6 +244,19 @@ await vault.put("alice", "api", currentKey, {
 A generator is told which entry is being rotated and its policy's arguments —
 deliberately not the value it is replacing. One that needs the old value can
 ask the vault for it.
+
+`every` says how often, in seconds. `rotationDue()` reports what is overdue and
+`rotateDue()` acts on it, so a scheduled job is two lines:
+
+```ts
+const { rotated, failed } = await vault.rotateDue()
+for (const { name, reason } of failed) console.warn(name, reason)
+```
+
+One credential that will not rotate — a provider that is down, a generator that
+throws — is named in `failed` and the rest still go. A pass that abandoned the
+remaining credentials because one endpoint was unreachable would be worse than
+not running.
 
 `rotationDue(now?)` reports entries whose `every` has elapsed since they were
 last rotated. Nothing rotates them for you; schedule it and act on the list.
@@ -286,6 +330,52 @@ and named in `failed` — re-sealing what cannot be read would only destroy it.
 > [!WARNING]
 > Losing every key loses every value sealed under them. Rekey before you retire
 > a key, and back the current one up where you would back up a password.
+
+## More than one writer
+
+Every entry carries a `revision` that goes up by one on each write. Read it,
+and hand it back to refuse a write that would land on top of someone else's:
+
+```ts
+const [entry] = await vault.list("alice")
+
+await vault.put("alice", "token", next, { expectedRevision: entry.revision })
+// throws 409 if anything wrote to it in between
+```
+
+`{ expectedRevision: null }` means "only if it does not exist yet", which is how
+to claim a name without racing another writer for it.
+
+To get that protection on every write without passing it each time, build the
+vault with `strictWrites`:
+
+```ts
+const vault = new Vault({ key, store, strictWrites: true })
+```
+
+It is off by default because it turns a write that used to succeed into a 409,
+and a vault written against 1.1 should keep behaving the way it did. Turn it on
+wherever more than one process writes the same store. Without it, two writers
+racing on one entry silently lose one of the two values — and the loser is told
+the write succeeded.
+
+How airtight it is depends on the store:
+
+| Store | Contested write |
+| --- | --- |
+| `PostgresStore` | Settled by the database, in one statement |
+| `SqliteStore` | Settled by SQLite, in one statement |
+| `FileStore` | Settled under a lock file, one writer at a time |
+| `MemoryStore` | Settled — there is only one process to contend |
+| Your own | Checked, then written: narrower, not closed |
+
+A custom store gets the weaker guarantee unless it implements `putIf`, which is
+one method and optional. Nothing breaks without it; the window between the
+check and the write just stays open.
+
+`remove` takes `expectedRevision` too. That one is read-then-delete rather than
+a single step, because a delete you can see is easier to live with than a write
+you cannot.
 
 ## Moving a vault
 

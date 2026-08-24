@@ -38,3 +38,6 @@ dist
 
 # generated API reference
 docs
+
+# coverage gate output
+.coverage
