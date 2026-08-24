@@ -52,6 +52,9 @@ what came back from there adds up.
   the fail-closed guarantee 1.3 introduced did not apply to deletions, and the
   line could be lost entirely if the process exited first. Every audit write is
   awaited now.
+- A test asserted that an encrypted file did not contain the string `"api"`.
+  The file is base64, so it did, about once in 1,200 runs. Markers in that test
+  are long enough to mean something now.
 
 ## 1.3.0 — 2026-08-24
 

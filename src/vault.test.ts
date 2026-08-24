@@ -691,15 +691,21 @@ test("FileStore hides the names as well as the values", async () => {
     const file = path.join(dir, "secrets.vault")
     const backed = new Vault({ key: KEY, store: new FileStore(file, KEY) })
 
-    await backed.put("alice", "stripe_key", "sk_live_secret", { metadata: { kind: "api" } })
+    // Every marker is long on purpose. The file is base64, so a short string
+    // like "api" turns up in it by chance about once in 1,200 runs — which is
+    // a test that fails in CI for no reason roughly never enough to be
+    // believed when it does.
+    await backed.put("alice-the-owner", "stripe-key-name", "sk_live_secret_value", {
+        metadata: { kind: "api-credential-kind" },
+    })
 
     // Nothing about the entry is legible — not even that it exists.
     const contents = await Bun.file(file).text()
     expect(contents.startsWith("VAULT1\n")).toBe(true)
-    expect(contents).not.toContain("stripe_key")
-    expect(contents).not.toContain("sk_live_secret")
-    expect(contents).not.toContain("alice")
-    expect(contents).not.toContain("api")
+    expect(contents).not.toContain("stripe-key-name")
+    expect(contents).not.toContain("sk_live_secret_value")
+    expect(contents).not.toContain("alice-the-owner")
+    expect(contents).not.toContain("api-credential-kind")
 })
 
 test("FileStore reads back what it wrote, from a new store", async () => {
